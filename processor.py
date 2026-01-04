@@ -3,12 +3,15 @@ import sqlite3
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import warnings
+
+# 忽略特定警告
+warnings.filterwarnings('ignore', category=FutureWarning)
 
 def process_market_data(db_path):
     conn = sqlite3.connect(db_path)
     
     # 1. 讀取數據並關聯 stock_info 取得市場與產業別
-    # 確保你的 downloader 已經把 '興櫃', '上市', '上櫃' 存入 stock_info
     query = """
     SELECT p.*, i.market, i.sector
     FROM stock_prices p
@@ -37,7 +40,10 @@ def process_market_data(db_path):
         # --- 🟢 第一步：資料清洗 ---
         group['daily_change'] = group['close'].pct_change()
         # 平滑異常值 (>60% 且非興櫃則視為異常)
-        is_emerging = group['market'].iloc[0] == '興櫃' if not group['market'].isna().all() else False
+        is_emerging = False
+        if not group['market'].isna().all():
+            is_emerging = group['market'].iloc[0] == '興櫃'
+        
         if not is_emerging:
             group.loc[abs(group['daily_change']) > 0.6, 'close'] = np.nan
             group['close'] = group['close'].ffill()
@@ -89,6 +95,9 @@ def process_market_data(db_path):
         # --- 🟣 第三步：年度巔峰貢獻度 (以最高價 Peak High 計算) ---
         def calc_peak_contribution(df_year):
             if df_year.empty:
+                df_year['peak_date'] = None
+                df_year['peak_high_ret'] = np.nan
+                df_year['strong_day_contribution'] = np.nan
                 return df_year
             
             # 確保有有效的高價數據
@@ -141,15 +150,20 @@ def process_market_data(db_path):
             
             return df_year
 
-        # 使用 include_groups=False 來避免 FutureWarning
+        # 保存 year 欄位，然後進行分組計算
+        year_values = group['year'].copy()
+        
+        # 進行分組計算
         try:
-            group = group.groupby('year', group_keys=False, observed=True).apply(
-                calc_peak_contribution, include_groups=False
-            )
-        except Exception as e:
-            # 如果出錯，使用舊方法並忽略警告
-            print(f"⚠️ 處理 {symbol} 時出現警告: {e}")
+            # 使用新方法
+            group = group.groupby('year', group_keys=False).apply(calc_peak_contribution, include_groups=False)
+        except TypeError:
+            # 如果新方法失敗，使用舊方法
             group = group.groupby('year', group_keys=False).apply(calc_peak_contribution)
+        
+        # 確保 year 欄位存在
+        if 'year' not in group.columns:
+            group['year'] = year_values
 
         # --- 🔵 第四步：原有技術指標 ---
         # MA
@@ -163,8 +177,17 @@ def process_market_data(db_path):
         group['macds'] = group['macd'].ewm(span=9, adjust=False).mean()
         group['macdh'] = group['macd'] - group['macds']
         
-        # YTD Ret (實測收盤)
-        group['year_start_price'] = group.groupby('year')['close'].transform('first')
+        # YTD Ret (實測收盤) - 修正這裡的分組方式
+        # 先計算每個年份的起始價格
+        year_start_prices = group.groupby('year')['close'].first()
+        
+        # 創建一個映射，將每個年份映射到起始價格
+        year_to_start_price = year_start_prices.to_dict()
+        
+        # 應用映射到每一行
+        group['year_start_price'] = group['year'].map(year_to_start_price)
+        
+        # 計算 YTD 回報率
         group['ytd_ret'] = ((group['close'] - group['year_start_price']) / group['year_start_price'] * 100).round(2)
 
         processed_list.append(group)
