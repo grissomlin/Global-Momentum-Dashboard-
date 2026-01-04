@@ -25,14 +25,20 @@ except ImportError:
     print("⚠️ 系統提示：找不到 processor.py")
     process_market_data = None
 
-# 💡 4. 【關鍵修正】動態導入模組，避免因缺少檔案崩潰，但保留所有市場功能
+# 💡 4. 保留 Notifier 功能
+try:
+    from notifier import StockNotifier
+    notifier = StockNotifier()
+except Exception:
+    notifier = None
+
+# 💡 5. 【關鍵修正】動態導入模組，避免因缺少檔案崩潰，但保留所有市場功能
 def dynamic_import(name):
     try:
         return __import__(name)
     except ImportError:
         return None
 
-# 這裡依然保留所有國家的接口，不會因為你現在只有台灣檔案就報錯
 downloader_tw = dynamic_import('downloader_tw')
 downloader_us = dynamic_import('downloader_us')
 downloader_cn = dynamic_import('downloader_cn')
@@ -90,10 +96,8 @@ def download_db_from_drive(service, file_name):
     except: return False
 
 def upload_db_to_drive(service, file_path, max_retries=3):
-    """【完整保留】您原始代碼中的分片上傳、進度顯示與 SSL 重試機制，一行都不刪"""
-    if not GDRIVE_FOLDER_ID or not os.path.exists(file_path): 
-        print(f"⚠️ 無法上傳 {file_path}")
-        return False
+    """【完整保留】分片上傳、進度顯示與 SSL 重試機制"""
+    if not GDRIVE_FOLDER_ID or not os.path.exists(file_path): return False
     
     file_name = os.path.basename(file_path)
     file_size = os.path.getsize(file_path)
@@ -127,7 +131,7 @@ def upload_db_to_drive(service, file_path, max_retries=3):
             print(f"⚠️ 上傳失敗: {error_msg}")
             if "SSL" in error_msg or "EOF" in error_msg:
                 time.sleep(5 * (attempt + 1))
-                service = get_drive_service() # 重連
+                service = get_drive_service()
             else:
                 time.sleep(2 * (attempt + 1))
     return False
@@ -137,39 +141,36 @@ def upload_db_to_drive(service, file_path, max_retries=3):
 def main():
     target_market = sys.argv[1].lower() if len(sys.argv) > 1 else 'all'
     service = get_drive_service()
+    all_summaries = []
 
-    # 只針對有定義的市場跑
     markets_to_run = [target_market] if target_market in module_map else list(module_map.keys())
 
     for m in markets_to_run:
         target_module = module_map.get(m)
-        if not target_module: # 💡 如果沒檔案就自動跳過，不會再噴報錯中止了！
+        if not target_module: # 💡 如果沒檔案就跳過，不會崩潰
             print(f"⏭️ 市場 {m.upper()} 缺少下載器檔案，跳過。")
             continue
             
         db_file = f"{m}_stock_warehouse.db"
         print(f"\n--- 🚀 市場啟動: {m.upper()} ---")
 
-        # 1. 抓取快取
         if service:
             download_db_from_drive(service, db_file)
 
-        # 2. 增量日期計算
+        # 增量日期計算
         last_date = get_db_last_date(db_file)
         actual_start = FORCE_START_DATE
         if last_date:
             actual_start = (pd.to_datetime(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # 3. 💡 執行下載與加工 (強制鎖定在 2024-2025)
+        # 💡 執行下載與加工 (強制 2024-2025)
         if actual_start and actual_start <= FORCE_END_DATE:
             print(f"📡 同步區間: {actual_start} ~ {FORCE_END_DATE}")
             target_module.run_sync(start_date=actual_start, end_date=FORCE_END_DATE)
             
-            # 特徵加工
             if process_market_data:
                 process_market_data(db_file)
 
-            # 優化與回傳
             if service:
                 try:
                     conn = sqlite3.connect(db_file)
@@ -179,7 +180,7 @@ def main():
                 except Exception as e:
                     print(f"❌ 優化上傳失敗: {e}")
 
-    print("\n✅ 所有選定市場處理完畢。")
+    print("\n✅ 處理完畢。")
 
 if __name__ == "__main__":
     main()
