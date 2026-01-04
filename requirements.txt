@@ -1,0 +1,44 @@
+# --- 1. 核心數據架構 ---
+pandas>=2.1.0
+numpy>=1.26.0
+openpyxl
+lxml
+html5lib
+requests
+cryptography
+python-dotenv
+pyperclip
+
+# --- 2. 核心下載與技術分析 ---
+yfinance>=0.2.40
+tqdm
+
+# --- 3. 全球六國清單獲取 ---
+akshare
+pykrx
+finance-datareader
+
+# --- 4. Google Drive 雲端同步 ---
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+
+# --- 5. 通知與通訊 ---
+resend
+
+# --- 6. 數據加工與效能優化 ---
+pyarrow
+peewee
+
+# --- 7. 儀表板與視覺化 ---
+streamlit
+plotly
+scipy
+
+# --- 8. 數據庫與 SQL 優化 ---
+sqlalchemy
+psycopg2-binary
+
+# --- 9. 其他輔助 ---
+beautifulsoup4
+typing-extensions
