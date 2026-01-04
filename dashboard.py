@@ -27,23 +27,56 @@ MARKET_MAP = {
     "韓股 (KR)": "kr"
 }
 
-# --- 2. Google Drive 服務初始化 ---
+# --- 2. 輔助函數：獲取配置值 ---
+def get_config_value(key, default=None):
+    """獲取配置值，優先從環境變數，其次從 Streamlit Secrets"""
+    # 先嘗試環境變數 (Render 部署用)
+    env_value = os.environ.get(key)
+    if env_value:
+        return env_value
+    
+    # 再嘗試 Streamlit Secrets (本地開發用)
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        # 如果在 Render 上 st.secrets 不可用，會跳到這裡
+        pass
+    
+    return default
+
+# --- 3. Google Drive 服務初始化 ---
 @st.cache_resource
 def get_gdrive_service():
-    if "GDRIVE_SERVICE_ACCOUNT" not in st.secrets:
-        st.error("❌ Secrets 中缺少 GDRIVE_SERVICE_ACCOUNT")
+    """初始化 Google Drive 服務，同時支援環境變數和 Streamlit Secrets"""
+    # 嘗試從環境變數或 Secrets 獲取服務帳戶資訊
+    service_account_json = get_config_value("GDRIVE_SERVICE_ACCOUNT")
+    
+    if not service_account_json:
+        st.error("❌ 找不到 GDRIVE_SERVICE_ACCOUNT 配置")
+        st.info("請在 Render 環境變數或 Streamlit Secrets 中設定 GDRIVE_SERVICE_ACCOUNT")
         return None
+    
     try:
-        info = json.loads(st.secrets["GDRIVE_SERVICE_ACCOUNT"])
+        # 解析 JSON (無論來自環境變數或 Secrets)
+        if isinstance(service_account_json, str):
+            info = json.loads(service_account_json)
+        else:
+            info = service_account_json
+        
         creds = service_account.Credentials.from_service_account_info(
             info, scopes=['https://www.googleapis.com/auth/drive.readonly']
         )
         return build('drive', 'v3', credentials=creds)
+    except json.JSONDecodeError as e:
+        st.error(f"❌ GDRIVE_SERVICE_ACCOUNT JSON 解析失敗: {e}")
+        return None
     except Exception as e:
         st.error(f"❌ 服務初始化失敗: {e}")
         return None
 
 def download_file(service, file_id, file_name):
+    """下載檔案從 Google Drive"""
     request = service.files().get_media(fileId=file_id)
     fh = io.FileIO(file_name, 'wb')
     downloader = MediaIoBaseDownload(fh, request)
@@ -110,7 +143,7 @@ def get_database_stats(db_path, market_code):
     
     return stats
 
-# --- 3. 側邊欄配置 ---
+# --- 4. 側邊欄配置 ---
 st.sidebar.title("🌐 導航選單")
 
 # 頁面選擇
@@ -137,7 +170,9 @@ db_stats = None
 
 if service and st.sidebar.button("🔄 同步資料庫", type="secondary"):
     with st.spinner("正在從雲端同步資料庫..."):
-        folder_id = st.secrets.get("GDRIVE_FOLDER_ID", "")
+        # 獲取資料夾 ID (從環境變數或 Secrets)
+        folder_id = get_config_value("GDRIVE_FOLDER_ID", "")
+        
         if folder_id:
             query = f"'{folder_id}' in parents and name = '{TARGET_DB}' and trashed = false"
             results = service.files().list(q=query, fields="files(id, name)").execute()
@@ -146,6 +181,8 @@ if service and st.sidebar.button("🔄 同步資料庫", type="secondary"):
                 download_file(service, files[0]['id'], TARGET_DB)
                 st.sidebar.success("✅ 同步完成")
                 st.rerun()  # 重新整理頁面以顯示最新數據
+        else:
+            st.sidebar.warning("⚠️ 未設定 GDRIVE_FOLDER_ID")
 
 # 顯示資料庫統計 (如果存在)
 if os.path.exists(TARGET_DB):
@@ -162,7 +199,7 @@ if os.path.exists(TARGET_DB):
         if db_stats['漲停天數'] > 0:
             st.metric("漲停天數", f"{db_stats['漲停天數']:,}")
 
-# --- 主頁面邏輯 ---
+# --- 5. 主頁面邏輯 ---
 def render_home_page():
     """首頁 - 策略篩選"""
     st.title("🏠 策略篩選中心")
@@ -232,16 +269,38 @@ def render_home_page():
                 # 顯示篩選結果
                 st.subheader(f"🎯 {year}年{month}月 符合訊號標的")
                 
-                # 這裡加入原有的篩選邏輯...
-                # [原有的篩選邏輯代碼...]
+                # 基本篩選邏輯
+                if strategy_type != "無":
+                    if strategy_type == "KD 黃金交叉":
+                        df = df[df['kd_golden_cross'] == 1]
+                    elif strategy_type == "MACD 柱狀圖轉正":
+                        df = df[df['macd_histogram_turn_positive'] == 1]
+                    elif strategy_type == "均線多頭排列(MA20>MA60)":
+                        df = df[df['ma20_ma60_cross'] == 1]
                 
-                # 顯示統計圖表
-                if 'ytd_ret' in df.columns:
-                    st.subheader("📊 今年以來報酬分布")
-                    fig = go.Figure(data=[go.Histogram(x=df['ytd_ret'], nbinsx=30)])
-                    fig.update_layout(title="YTD 報酬分布", xaxis_title="報酬率(%)", yaxis_title="股票數量")
-                    st.plotly_chart(fig, use_container_width=True)
+                # 背離條件篩選
+                if divergence_type != "不限":
+                    if divergence_type == "MACD 底部背離":
+                        df = df[df['macd_divergence'] == 1]
+                    elif divergence_type == "KD 底部背離":
+                        df = df[df['kd_divergence'] == 1]
+                    elif divergence_type == "雙重背離 (MACD+KD)":
+                        df = df[(df['macd_divergence'] == 1) & (df['kd_divergence'] == 1)]
                 
+                # 顯示結果
+                if not df.empty:
+                    st.success(f"✅ 找到 {len(df)} 個符合條件的股票")
+                    st.dataframe(df.head(50), use_container_width=True)
+                    
+                    # 顯示統計圖表
+                    if 'ytd_ret' in df.columns:
+                        st.subheader("📊 今年以來報酬分布")
+                        fig = go.Figure(data=[go.Histogram(x=df['ytd_ret'], nbinsx=30)])
+                        fig.update_layout(title="YTD 報酬分布", xaxis_title="報酬率(%)", yaxis_title="股票數量")
+                        st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("⚠️ 沒有找到符合條件的股票")
+                    
             else:
                 st.info("📭 該時段內無資料，請更換年份或月份。")
                 
@@ -496,14 +555,67 @@ def render_debug_tools():
     """除錯工具頁面"""
     st.title("🔍 資料庫除錯工具")
     
-    # 顯示除錯工具內容
-    try:
-        from debug_db import main
-        main()
-    except:
-        st.warning("找不到 debug_db.py 或匯入失敗")
+    # 顯示環境資訊
+    st.subheader("環境資訊")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**作業系統**:", os.name)
+        st.write("**當前目錄**:", os.getcwd())
+        st.write("**Python 版本**:", os.sys.version)
+    
+    with col2:
+        st.write("**資料庫檔案**:")
+        for market in MARKET_MAP.values():
+            db_file = f"{market}_stock_warehouse.db"
+            if os.path.exists(db_file):
+                st.success(f"✅ {db_file} - {os.path.getsize(db_file):,} bytes")
+            else:
+                st.error(f"❌ {db_file} - 不存在")
+    
+    # 檢查配置
+    st.subheader("配置檢查")
+    gdrive_sa = get_config_value("GDRIVE_SERVICE_ACCOUNT")
+    if gdrive_sa:
+        st.success("✅ GDRIVE_SERVICE_ACCOUNT 已設定")
+        # 顯示部分資訊 (保護敏感資料)
+        if isinstance(gdrive_sa, str):
+            try:
+                sa_info = json.loads(gdrive_sa)
+                st.write("**服務帳戶**:", sa_info.get("client_email", "未知"))
+            except:
+                st.write("**服務帳戶**: JSON 格式正確")
+    else:
+        st.error("❌ GDRIVE_SERVICE_ACCOUNT 未設定")
+    
+    folder_id = get_config_value("GDRIVE_FOLDER_ID")
+    if folder_id:
+        st.success(f"✅ GDRIVE_FOLDER_ID 已設定: {folder_id}")
+    else:
+        st.warning("⚠️ GDRIVE_FOLDER_ID 未設定")
+    
+    # 資料庫檢查
+    if os.path.exists(TARGET_DB):
+        st.subheader("資料庫檢查")
+        try:
+            conn = sqlite3.connect(TARGET_DB)
+            cursor = conn.cursor()
+            
+            # 檢查表格
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = cursor.fetchall()
+            
+            st.write("**資料庫表格**:")
+            for table in tables:
+                cursor.execute(f"SELECT COUNT(*) FROM {table[0]};")
+                count = cursor.fetchone()[0]
+                st.write(f"- {table[0]}: {count:,} 筆記錄")
+            
+            conn.close()
+        except Exception as e:
+            st.error(f"資料庫檢查失敗: {e}")
 
-# --- 頁面路由 ---
+# --- 6. 頁面路由 ---
 page_mapping = {
     "home": render_home_page,
     "weekly": render_weekly_analysis,
