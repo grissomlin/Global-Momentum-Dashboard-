@@ -1,0 +1,88 @@
+name: Market Data Monitor (Parallel Matrix)
+
+on:
+  workflow_dispatch:
+    inputs:
+      market:
+        description: '選擇要執行的市場 (Select Market)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - tw
+          - us
+          - cn
+          - hk
+          - jp
+          - kr
+  schedule:
+    - cron: '0 6 * * 1-5' # 台北時間 14:00 自動執行
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          # 判斷輸入，如果是 all 就輸出完整列表，否則輸出單一標籤
+          INPUT="${{ github.event.inputs.market }}"
+          if [ "$INPUT" == "" ]; then INPUT="all"; fi # 處理排程觸發
+
+          if [ "$INPUT" == "all" ]; then
+            echo 'matrix=["tw", "us", "cn", "hk", "jp", "kr"]' >> $GITHUB_OUTPUT
+          else
+            echo "matrix=[\"$INPUT\"]" >> $GITHUB_OUTPUT
+          fi
+
+  run-market-sync:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false # 其中一台失敗，其他台繼續跑
+      matrix:
+        market: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then 
+            pip install -r requirements.txt
+          else
+            pip install pandas numpy yfinance tqdm python-dotenv scipy requests lxml
+            pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+            pip install pykrx finance-datareader akshare
+          fi
+
+      - name: Run Market Update
+        run: |
+          echo "🌍 正在開機執行目標市場: ${{ matrix.market }}"
+          # 💡 關鍵：現在每台機器只跑 matrix 傳進來的那個參數
+          python -u main.py ${{ matrix.market }}
+
+      - name: Upload Database Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-${{ matrix.market }}-${{ github.run_id }}
+          path: "*.db"
+          retention-days: 3
