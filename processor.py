@@ -8,6 +8,78 @@ import warnings
 # 忽略特定警告
 warnings.filterwarnings('ignore', category=FutureWarning)
 
+class MarketConfig:
+    """市場配置類別，統一管理不同市場的規則"""
+    
+    # 市場分類定義
+    MARKET_RULES = {
+        # 台灣市場
+        'TW_LISTED': {  # 上市
+            'limit_up_pct': 0.10,
+            'threshold': 0.10,  # 強勢日閾值
+            'strength_intervals': [(10, 'RANK_10UP')],  # 只用一個10%以上的區間
+            'max_strength': 10
+        },
+        'TW_OTC': {  # 上櫃
+            'limit_up_pct': 0.10,
+            'threshold': 0.10,
+            'strength_intervals': [(10, 'RANK_10UP')],
+            'max_strength': 10
+        },
+        'TW_EMERGING': {  # 興櫃
+            'limit_up_pct': None,  # 無漲跌幅限制
+            'threshold': 0.20,
+            'strength_intervals': [
+                (10, 'RANK_10_20'), (20, 'RANK_20_30'), (30, 'RANK_30_40'),
+                (40, 'RANK_40_50'), (50, 'RANK_50_60'), (60, 'RANK_60_70'),
+                (70, 'RANK_70_80'), (80, 'RANK_80_90'), (90, 'RANK_90_100'),
+                (100, 'RANK_100UP')
+            ],
+            'max_strength': 100
+        },
+        # 韓國市場
+        'KR_KOSPI': {
+            'limit_up_pct': 0.30,
+            'threshold': 0.30,  # 韓國強勢日閾值用30%
+            'strength_intervals': [
+                (10, 'RANK_10_20'), (20, 'RANK_20_30'), (30, 'RANK_30UP')
+            ],
+            'max_strength': 30
+        },
+        'KR_KOSDAQ': {
+            'limit_up_pct': 0.30,
+            'threshold': 0.30,
+            'strength_intervals': [
+                (10, 'RANK_10_20'), (20, 'RANK_20_30'), (30, 'RANK_30UP')
+            ],
+            'max_strength': 30
+        }
+    }
+    
+    @classmethod
+    def get_market_config(cls, market, market_detail):
+        """根據市場和市場細分類獲取配置"""
+        # 台灣市場判斷
+        if market == 'TW':
+            if market_detail == 'emerging':
+                return cls.MARKET_RULES['TW_EMERGING']
+            elif market_detail in ['listed', 'tse']:
+                return cls.MARKET_RULES['TW_LISTED']
+            elif market_detail in ['otc', 'gtsm']:
+                return cls.MARKET_RULES['TW_OTC']
+        
+        # 韓國市場判斷（從下載器的資料判斷）
+        elif market == 'KR' or 'KOSPI' in str(market) or 'KOSDAQ' in str(market):
+            if 'KOSPI' in str(market_detail) or 'KOSPI' in str(market):
+                return cls.MARKET_RULES['KR_KOSPI']
+            elif 'KOSDAQ' in str(market_detail) or 'KOSDAQ' in str(market):
+                return cls.MARKET_RULES['KR_KOSDAQ']
+            else:
+                return cls.MARKET_RULES['KR_KOSPI']  # 預設為KOSPI
+        
+        # 預設為台灣上市櫃規則（向下兼容）
+        return cls.MARKET_RULES['TW_LISTED']
+
 def process_market_data(db_path):
     conn = sqlite3.connect(db_path)
     
@@ -29,14 +101,6 @@ def process_market_data(db_path):
 
     processed_list = []
     
-    # 定義市場分類函數
-    def is_unrestricted_market(market_detail):
-        """判斷是否為無漲跌幅限制的市場"""
-        if pd.isna(market_detail):
-            return False
-        unrestricted_markets = ['emerging', 'managed', 'strategic']  # 興櫃、管理股票、戰略新板
-        return market_detail in unrestricted_markets
-    
     # 2. 分組計算
     for symbol, group in df.groupby('symbol'):
         group = group.copy().sort_values('date')
@@ -46,15 +110,25 @@ def process_market_data(db_path):
             continue
         
         # 獲取市場信息
+        market = group['market'].iloc[0] if not group['market'].isna().all() else ''
         market_detail = group['market_detail'].iloc[0] if not group['market_detail'].isna().all() else ''
-        is_unrestricted = is_unrestricted_market(market_detail)
+        
+        # 獲取市場配置
+        config = MarketConfig.get_market_config(market, market_detail)
+        limit_up_pct = config['limit_up_pct']
+        is_unrestricted = (limit_up_pct is None)
+        threshold = config['threshold']  # 強勢日閾值
+        
+        print(f"處理 {symbol}: 市場={market}, 細類={market_detail}, 漲停={limit_up_pct}, 強勢閾值={threshold}")
         
         # --- 🟢 第一步：資料清洗 ---
         group['daily_change'] = group['close'].pct_change()
         
-        # 平滑異常值 (有漲跌幅限制的市場，>60%視為異常)
-        if not is_unrestricted:
-            group.loc[abs(group['daily_change']) > 0.6, 'close'] = np.nan
+        # 平滑異常值 (有漲跌幅限制的市場)
+        if not is_unrestricted and limit_up_pct is not None:
+            # 將超過漲停幅度的視為異常
+            max_allowed_change = limit_up_pct * 1.5  # 允許一些誤差
+            group.loc[abs(group['daily_change']) > max_allowed_change, 'close'] = np.nan
             group['close'] = group['close'].ffill()
         
         # 基礎欄位
@@ -62,127 +136,89 @@ def process_market_data(db_path):
         group['avg_vol_20'] = group['volume'].rolling(window=20).mean()
         group['year'] = group['date'].dt.year
         
-        # --- 🔴 第二步：漲停與長紅區間標記 (LU_Type & Brackets) ---
+        # --- 🔴 第二步：漲停與長紅區間標記 ---
         # 漲幅百分比
         change_pct = group['daily_change'] * 100
         
-        # 判定是否為「受限市場漲停」
+        # 判定是否為「漲停」
         group['is_limit_up'] = 0
-        if not is_unrestricted:
-            # 上市櫃 10% 判定 (考慮四捨五入)
-            limit_price = group['prev_close'] * 1.1
+        if limit_up_pct is not None:
+            # 根據市場配置的漲停幅度計算
+            limit_price = group['prev_close'] * (1 + limit_up_pct)
             limit_price = round(limit_price, 2)
             group['is_limit_up'] = (group['close'] >= limit_price * 0.999).astype(int)
         
-        # --- 🟡 新增：詳細漲幅區間分類 ---
-        def label_detailed_strength(row, is_unrestricted):
-            """為無漲跌幅限制市場創建詳細區間分類"""
+        # --- 🟡 新增：詳細漲幅區間分類（統一方法）---
+        def label_detailed_strength(row):
+            """為所有市場創建詳細區間分類"""
             chg = row['daily_change'] * 100
             
-            if pd.isna(chg):
+            if pd.isna(chg) or chg <= 0:
                 return "NEGATIVE"
             
-            if is_unrestricted:
-                # 無漲跌幅限制市場：每10%一個區間，直到100%以上
-                if chg >= 100:
-                    return "RANK_100UP"
-                elif chg >= 90:
-                    return "RANK_90_100"
-                elif chg >= 80:
-                    return "RANK_80_90"
-                elif chg >= 70:
-                    return "RANK_70_80"
-                elif chg >= 60:
-                    return "RANK_60_70"
-                elif chg >= 50:
-                    return "RANK_50_60"
-                elif chg >= 40:
-                    return "RANK_40_50"
-                elif chg >= 30:
-                    return "RANK_30_40"
-                elif chg >= 20:
-                    return "RANK_20_30"
-                elif chg >= 10:
-                    return "RANK_10_20"
-                elif chg > 0:
-                    return "POSITIVE"
-            else:
-                # 有漲跌幅限制市場：簡化分類
-                if chg >= 10:
-                    return "RANK_10UP"
-                elif chg > 0:
-                    return "POSITIVE"
+            # 使用市場配置的區間
+            for min_val, rank_label in config['strength_intervals']:
+                if chg >= min_val:
+                    # 找到適合的區間
+                    if rank_label == 'RANK_10UP' or rank_label == 'RANK_30UP':
+                        # 這些是「以上」的區間
+                        return rank_label
+                    else:
+                        # 檢查是否在區間內
+                        next_min = next((m for m, _ in config['strength_intervals'] if m > min_val), None)
+                        if next_min is None or chg < next_min:
+                            return rank_label
             
-            return "NEGATIVE"
+            # 如果小於最小區間但是正值
+            return "POSITIVE"
         
         # 應用詳細分類
         group['strength_rank'] = group.apply(
-            lambda row: label_detailed_strength(row, is_unrestricted), 
+            lambda row: label_detailed_strength(row), 
             axis=1
         )
         
         # --- 🟠 新增：漲幅區間數值標記（用於統計）---
-        def get_strength_value(row, is_unrestricted):
+        def get_strength_value(row):
             """返回漲幅區間的數值表示"""
             chg = row['daily_change'] * 100
             
             if pd.isna(chg) or chg <= 0:
                 return 0
             
-            if is_unrestricted:
-                # 無漲跌幅限制：返回區間下限
-                if chg >= 100:
-                    return 100
-                elif chg >= 90:
-                    return 90
-                elif chg >= 80:
-                    return 80
-                elif chg >= 70:
-                    return 70
-                elif chg >= 60:
-                    return 60
-                elif chg >= 50:
-                    return 50
-                elif chg >= 40:
-                    return 40
-                elif chg >= 30:
-                    return 30
-                elif chg >= 20:
-                    return 20
-                elif chg >= 10:
-                    return 10
-                else:
-                    return 1
-            else:
-                # 有漲跌幅限制：簡單分類
-                if chg >= 10:
-                    return 10
-                else:
-                    return 1
+            # 使用市場配置的區間
+            for min_val, rank_label in config['strength_intervals']:
+                if chg >= min_val:
+                    # 如果是「以上」的區間，返回該值
+                    if rank_label in ['RANK_10UP', 'RANK_30UP']:
+                        return min_val
+                    # 檢查是否在區間內
+                    next_min = next((m for m, _ in config['strength_intervals'] if m > min_val), None)
+                    if next_min is None or chg < next_min:
+                        return min_val
+            
+            # 小於最小區間但是正值
+            return 1
         
         group['strength_value'] = group.apply(
-            lambda row: get_strength_value(row, is_unrestricted), 
+            lambda row: get_strength_value(row), 
             axis=1
         )
         
-        # --- 🟤 新增：興櫃股票統計特徵 ---
-        if is_unrestricted:
-            # 計算每個區間的出現次數
-            strength_counts = group['strength_rank'].value_counts().to_dict()
-            
-            # 創建特徵：過去20天內各強度區間的出現次數
-            for rank in ['RANK_10_20', 'RANK_20_30', 'RANK_30_40', 'RANK_40_50', 
-                        'RANK_50_60', 'RANK_60_70', 'RANK_70_80', 'RANK_80_90', 
-                        'RANK_90_100', 'RANK_100UP']:
-                col_name = f'count_{rank.lower()}'
-                group[col_name] = (group['strength_rank'] == rank).rolling(window=20, min_periods=1).sum()
+        # --- 🟤 新增：特殊市場統計特徵 ---
+        if is_unrestricted or limit_up_pct == 0.30:
+            # 對於無漲跌幅限制或韓國市場，計算各區間出現次數
+            for min_val, rank_label in config['strength_intervals']:
+                if rank_label not in ['RANK_10UP', 'RANK_30UP']:  # 排除「以上」的區間
+                    col_name = f'count_{rank_label.lower()}'
+                    group[col_name] = (group['strength_rank'] == rank_label).rolling(window=20, min_periods=1).sum()
         
         # 漲停類型 (LU_Type4) - 僅限有漲跌幅限制的市場
         group['lu_type'] = None
-        if not is_unrestricted:
+        if limit_up_pct is not None:
             conditions = [
                 (group['is_limit_up'] == 1) & (group['open'] == group['close']) & (group['high'] == group['low']),
-                (group['is_limit_up'] == 1) & (group['open'] > group['prev_close'] * 1.05),
+                (group['is_limit_up'] == 1) & (group['open'] > group['prev_close'] * (1 + limit_up_pct * 0.5)),
                 (group['is_limit_up'] == 1) & (group['volume'] > group['avg_vol_20'] * 2),
                 (group['is_limit_up'] == 1)
             ]
@@ -190,13 +226,13 @@ def process_market_data(db_path):
             group['lu_type'] = np.select(conditions, choices, default=None)
 
         # 連板次數
-        if not is_unrestricted:
+        if limit_up_pct is not None:
             streak = group['is_limit_up'].groupby((group['is_limit_up'] != group['is_limit_up'].shift()).cumsum()).cumsum()
             group['consecutive_limits'] = np.where(group['is_limit_up'] == 1, streak, 0)
         else:
             group['consecutive_limits'] = 0
 
-        # --- 🟣 第三步：年度巔峰貢獻度 (以最高價 Peak High 計算) ---
+        # --- 🟣 第三步：年度巔峰貢獻度 ---
         def calc_peak_contribution(df_year):
             if df_year.empty:
                 df_year['peak_date'] = None
@@ -238,11 +274,10 @@ def process_market_data(db_path):
             
             mask_before = df_year['date'] <= peak_date if peak_date else pd.Series(False, index=df_year.index)
             
-            # 計算所有「漲幅 > 10%」日子的總貢獻
+            # 計算所有「漲幅 > threshold」日子的總貢獻
             daily_logs = np.log(df_year['close'] / df_year['prev_close'])
             
-            # 調整閾值：有漲跌幅限制用10%，無限制用20%
-            threshold = 0.10 if not is_unrestricted else 0.20
+            # 使用市場配置的threshold
             strong_day_mask = (df_year['daily_change'] >= threshold) & mask_before
             
             if strong_day_mask.any() and total_peak_log > 0:
@@ -270,7 +305,7 @@ def process_market_data(db_path):
         if 'year' not in group.columns:
             group['year'] = year_values
 
-        # --- 🔵 第四步：原有技術指標 ---
+        # --- 🔵 第四步：技術指標 ---
         # MA
         group['ma20'] = group['close'].rolling(window=20).mean()
         group['ma60'] = group['close'].rolling(window=60).mean()
@@ -326,50 +361,74 @@ def process_market_data(db_path):
     # 創建索引
     conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_analysis (symbol, date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_strength_rank ON stock_analysis (strength_rank)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_market ON stock_analysis (market_detail)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_market ON stock_analysis (market)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_market_detail ON stock_analysis (market_detail)")
     
     # 5. 計算統計信息
     total_symbols = df_final['symbol'].nunique()
     date_range = f"{df_final['date'].min()} 到 {df_final['date'].max()}"
     
-    # 統計興櫃股票的各區間漲幅數量
-    emerging_stocks = df_final[df_final['market_detail'] == 'emerging']
+    # 統計不同市場的漲幅分佈
+    print("\n📊 全球市場漲幅區間統計：")
     
-    if not emerging_stocks.empty:
-        print("\n📊 興櫃股票漲幅區間統計：")
-        strength_distribution = emerging_stocks['strength_rank'].value_counts().sort_index()
+    for market in df_final['market'].unique():
+        if pd.isna(market):
+            continue
+            
+        market_data = df_final[df_final['market'] == market]
+        if market_data.empty:
+            continue
+            
+        print(f"\n🔹 市場: {market}")
+        strength_distribution = market_data['strength_rank'].value_counts().sort_index()
         
         for rank, count in strength_distribution.items():
-            if rank.startswith('RANK_'):
-                # 提取區間
-                if rank == 'RANK_100UP':
-                    print(f"  {rank}: {count:,} 筆 (100%以上)")
-                elif '_' in rank:
-                    parts = rank.split('_')
-                    if len(parts) >= 3:
-                        lower = parts[1]
-                        upper = parts[2] if parts[2] != 'UP' else '∞'
-                        print(f"  {rank}: {count:,} 筆 ({lower}% ~ {upper}%)")
-                else:
-                    print(f"  {rank}: {count:,} 筆")
+            if rank != "NEGATIVE" and rank != "POSITIVE":
+                print(f"  {rank}: {count:,} 筆")
         
-        # 計算平均每日漲幅大於10%的數量
-        strong_days = (emerging_stocks['daily_change'] > 0.10).sum()
-        total_days = len(emerging_stocks)
+        # 計算各市場的強勢日比例
+        if market in ['KR', 'KOSPI', 'KOSDAQ']:
+            strong_threshold = 0.30  # 韓國30%
+        elif market == 'TW':
+            # 判斷是否為興櫃
+            emerging_data = market_data[market_data['market_detail'] == 'emerging']
+            if not emerging_data.empty:
+                strong_threshold = 0.20  # 台灣興櫃20%
+            else:
+                strong_threshold = 0.10  # 台灣上市櫃10%
+        else:
+            strong_threshold = 0.10  # 預設10%
+        
+        strong_days = (market_data['daily_change'] > strong_threshold).sum()
+        total_days = len(market_data)
         strong_percentage = (strong_days / total_days * 100) if total_days > 0 else 0
-        print(f"  📈 漲幅大於10%的天數: {strong_days:,} / {total_days:,} ({strong_percentage:.1f}%)")
+        print(f"  📈 漲幅大於{strong_threshold*100:.0f}%的天數: {strong_days:,} / {total_days:,} ({strong_percentage:.1f}%)")
+        
+        # 特別顯示韓國市場的統計
+        if market in ['KR', 'KOSPI', 'KOSDAQ']:
+            kr_10_20 = ((market_data['daily_change'] >= 0.10) & (market_data['daily_change'] < 0.20)).sum()
+            kr_20_30 = ((market_data['daily_change'] >= 0.20) & (market_data['daily_change'] < 0.30)).sum()
+            kr_30_up = (market_data['daily_change'] >= 0.30).sum()
+            print(f"  🇰🇷 韓國專屬統計:")
+            print(f"     10-20%: {kr_10_20:,} 筆")
+            print(f"     20-30%: {kr_20_30:,} 筆")
+            print(f"     30%以上: {kr_30_up:,} 筆")
     
     conn.close()
     
     print(f"""
-✅ 特徵工程完成！
+✅ 全球市場特徵工程完成！
 📊 處理統計：
    - 處理股票數量: {total_symbols}
    - 數據期間: {date_range}
    - 總數據行數: {len(df_final):,}
    - 新增特徵: 詳細漲幅區間、漲停標記、強度分級、年度巔峰貢獻度、技術指標等
-   - 特別功能: 興櫃股票每10%漲幅區間統計
+   - 支援市場: 台灣上市/上櫃/興櫃、韓國KOSPI/KOSDAQ
+   - 特別功能: 跨市場統一漲幅區間分析
     """)
 
 if __name__ == "__main__":
-    process_market_data("tw_stock_warehouse.db")
+    # 可以根據需要選擇處理哪個資料庫
+    # process_market_data("tw_stock_warehouse.db")  # 台灣
+    process_market_data("kr_stock_warehouse.db")  # 韓國
+    # 未來可以擴展: process_market_data("us_stock_warehouse.db")  # 美國
