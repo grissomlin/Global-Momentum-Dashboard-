@@ -1,27 +1,20 @@
-# kbar_contribution.py  (精準切段版)
+# kbar_contribution.py
 # -*- coding: utf-8 -*-
 """
-kbar_contribution.py
---------------------
-精準切段版：用「日K逐日 log-return」去切週 / 月區段（依 kbar_weekly / kbar_monthly 的 period_start/period_end）
-來算：
-
-- 年K分箱（0~1000 每100 + 1000UP；0~100 再 10% 細分；0-50/50-100）
-- 週/月集中度（top1 week / top4 weeks / top1 month / top3 months）
-- 高點對齊（peak_date 對到 <=peak_date 的最後交易日）
-- peak 前完成度（到 peak 為止的 logret / 年logret）
-- peak 前漲停貢獻（漲停日 logret 加總 / 年logret；也提供 / peak_logret）
-- peak 前週/月貢獻（用「日K切段」精準加總，不再用週/月收盤近似）
-
+kbar_contribution.py  (精準切段版｜都來｜不刪舊功能，只加)
+-----------------------------------------------
 依賴：
-- processor.py -> stock_analysis（需含 open/high/low/close/prev_close/is_limit_up）
 - kbar_aggregator.py -> kbar_weekly / kbar_monthly / kbar_yearly
+- processor.py -> stock_analysis（需 open/close/prev_close/is_limit_up）
 
-用法：
-    python kbar_contribution.py tw_stock_warehouse.db
-或：
-    from kbar_contribution import build_contribution_tables
-    build_contribution_tables("tw_stock_warehouse.db")
+輸出：
+- year_contribution
+- year_contribution_bins
+
+新增（你說「都來」）：
+- burst_style_week / burst_style_month：
+    * ONE_WEEK_BURST  : top1_week_share_net >= 0.5
+    * ONE_MONTH_BURST : top1_month_share_net >= 0.5
 """
 
 import sys
@@ -83,14 +76,8 @@ def _safe_log_ratio(a: float, b: float) -> float:
     return float(np.log(a / b))
 
 
-def _topk_share(period_logrets: np.ndarray, denom: float, k: int) -> float:
-    """
-    只用「正的 period logret」做 top-k 集中度（避免下跌週/月干擾）
-    denom <=0 回 0
-    """
-    if denom <= 0:
-        return 0.0
-    if period_logrets.size == 0:
+def _topk_share_pos(period_logrets: np.ndarray, denom: float, k: int) -> float:
+    if denom <= 0 or period_logrets.size == 0:
         return 0.0
     pos = period_logrets[np.isfinite(period_logrets) & (period_logrets > 0)]
     if pos.size == 0:
@@ -99,29 +86,49 @@ def _topk_share(period_logrets: np.ndarray, denom: float, k: int) -> float:
     return float(np.sum(pos_sorted[:k]) / denom)
 
 
-def _sum_pos_share(period_logrets: np.ndarray, denom: float) -> float:
-    if denom <= 0:
+def _topk_share_net(period_logrets: np.ndarray, denom: float, k: int) -> float:
+    if denom <= 0 or period_logrets.size == 0:
         return 0.0
-    if period_logrets.size == 0:
+    v = period_logrets[np.isfinite(period_logrets)]
+    if v.size == 0:
+        return 0.0
+    v_sorted = np.sort(v)[::-1]
+    return float(np.sum(v_sorted[:k]) / denom)
+
+
+def _sum_pos_share(period_logrets: np.ndarray, denom: float) -> float:
+    if denom <= 0 or period_logrets.size == 0:
         return 0.0
     s = float(np.nansum(period_logrets[np.isfinite(period_logrets) & (period_logrets > 0)]))
     return float(s / denom)
 
 
+def _sum_net_share(period_logrets: np.ndarray, denom: float) -> float:
+    if denom <= 0 or period_logrets.size == 0:
+        return 0.0
+    s = float(np.nansum(period_logrets[np.isfinite(period_logrets)]))
+    return float(s / denom)
+
+
+def _max_drawdown_log_from_close(close: pd.Series) -> float:
+    c = pd.to_numeric(close, errors="coerce")
+    c = c[(c > 0) & np.isfinite(c)]
+    if c.empty:
+        return 0.0
+    logc = np.log(c.values.astype(float))
+    run_max = np.maximum.accumulate(logc)
+    dd = logc - run_max
+    return float(np.min(dd))
+
+
 # -----------------------------------------------------------------------------
-# period segmentation (精準切段：依 kbar_* 的 period_start/period_end)
+# period segmentation (精準切段)
 # -----------------------------------------------------------------------------
 def _sum_logret_by_period(
     daily: pd.DataFrame,
     periods: pd.DataFrame,
     cutoff_date: Optional[pd.Timestamp] = None,
 ) -> np.ndarray:
-    """
-    daily: columns [date, d_logret]
-    periods: columns [period_start, period_end] (datetime)
-    cutoff_date: 若提供，只計算 <= cutoff_date 的日K（用於 peak 前）
-    回傳每個 period 的 logret 加總 array（長度 = len(periods)）
-    """
     if daily.empty or periods.empty:
         return np.array([], dtype=float)
 
@@ -145,9 +152,6 @@ def _sum_logret_by_period(
 
 
 def _align_peak_trade_date(daily_dates: pd.Series, peak_date: pd.Timestamp) -> Optional[pd.Timestamp]:
-    """
-    把 peak_date 對齊到 <= peak_date 的最後交易日
-    """
     if peak_date is None or pd.isna(peak_date):
         return None
     dd = pd.to_datetime(daily_dates, errors="coerce").dropna().sort_values()
@@ -172,7 +176,7 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
         if missing:
             raise RuntimeError(f"缺少必要表：{missing}\n請先跑 processor.py 與 kbar_aggregator.py")
 
-        # 年K（kbar_yearly 建議已經把 year_peak_date/year_peak_high 算好）
+        # 年K
         y = pd.read_sql(
             """
             SELECT symbol, year,
@@ -203,7 +207,7 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
         y["period_end"] = pd.to_datetime(y["period_end"], errors="coerce")
         y["year_peak_date"] = pd.to_datetime(y["year_peak_date"], errors="coerce")
 
-        # 年報酬 / 年log
+        # 年報酬
         y["year_ret_pct"] = (y["y_close"].astype(float) / y["y_open"].astype(float) - 1.0) * 100.0
         y["year_logret"] = np.log(y["y_close"].astype(float) / y["y_open"].astype(float)).replace(
             [np.inf, -np.inf], np.nan
@@ -214,7 +218,7 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
         y["year_ret_bin_10_under100"] = y["year_ret_pct"].apply(_bin_year_ret_10_under100)
         y["year_ret_bin_50_under100"] = y["year_ret_pct"].apply(_bin_year_ret_50_under100)
 
-        # 週/月 periods（用 period_start/period_end 切段）
+        # 週/月 periods
         wk = pd.read_sql(
             """
             SELECT symbol, year, week_id, period_start, period_end
@@ -234,7 +238,7 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
         mk["period_start"] = pd.to_datetime(mk["period_start"], errors="coerce")
         mk["period_end"] = pd.to_datetime(mk["period_end"], errors="coerce")
 
-        # 日K（用 stock_analysis，因為你後面會做異常清洗/補值，最好沿用同一層）
+        # 日K（stock_analysis）
         sa = pd.read_sql(
             """
             SELECT symbol, date, open, close, prev_close, is_limit_up
@@ -247,21 +251,16 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
         sa["year"] = sa["date"].dt.year.astype(int)
         sa["is_limit_up"] = pd.to_numeric(sa["is_limit_up"], errors="coerce").fillna(0).astype(int)
 
-        # 建「逐日 logret」：
-        # - 第一天用 log(close/open)（避免跨年 prev_close 影響）
-        # - 其餘用 log(close / prev_close)
+        # 逐日 logret：
         sa["d_logret"] = 0.0
-        # close/prev_close
         mask_cp = (sa["close"].astype(float) > 0) & (sa["prev_close"].astype(float) > 0)
         sa.loc[mask_cp, "d_logret"] = np.log(sa.loc[mask_cp, "close"].astype(float) / sa.loc[mask_cp, "prev_close"].astype(float))
 
-        # 把每個 symbol-year 的第一筆替換為 log(close/open)
         sa["rank_in_year"] = sa.groupby(["symbol", "year"]).cumcount()
         mask_first = sa["rank_in_year"] == 0
         mask_oc = mask_first & (sa["close"].astype(float) > 0) & (sa["open"].astype(float) > 0)
         sa.loc[mask_oc, "d_logret"] = np.log(sa.loc[mask_oc, "close"].astype(float) / sa.loc[mask_oc, "open"].astype(float))
 
-        # 主迴圈：每個 symbol-year 一筆
         rows = []
         for _, r in y.iterrows():
             sym = r["symbol"]
@@ -269,61 +268,89 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             year_open = float(r["y_open"])
             year_close = float(r["y_close"])
             year_logret = float(r["year_logret"])
-            denom = year_logret if year_logret > 0 else 0.0
+            denom_year = year_logret if year_logret > 0 else 0.0
 
-            # 取該年日K
             d = sa[(sa["symbol"] == sym) & (sa["year"] == yr)].copy()
             if d.empty:
                 continue
             d = d.sort_values("date")
 
-            # peak_date 對齊到最後交易日
+            # 年內最大回撤
+            year_max_dd_log = _max_drawdown_log_from_close(d["close"])
+
+            # peak date 對齊
             peak_date_raw = r["year_peak_date"]
             peak_trade_date = _align_peak_trade_date(d["date"], peak_date_raw) if pd.notna(peak_date_raw) else None
 
-            # peak_logret_from_open（用「年開盤」→「peak_trade_date 當天 close」）
             peak_close = np.nan
             if peak_trade_date is not None:
                 d_peak = d[d["date"] == peak_trade_date]
                 if not d_peak.empty:
                     peak_close = float(d_peak.iloc[-1]["close"])
+
             peak_logret = _safe_log_ratio(peak_close, year_open) if np.isfinite(peak_close) else 0.0
+            denom_peak = peak_logret if peak_logret > 0 else 0.0
+
+            # 從 peak 到年末回撤
+            peak_to_year_end_dd_log = 0.0
+            if peak_trade_date is not None and np.isfinite(peak_close) and peak_close > 0:
+                year_end_close = float(d.iloc[-1]["close"]) if np.isfinite(d.iloc[-1]["close"]) else np.nan
+                peak_to_year_end_dd_log = _safe_log_ratio(year_end_close, peak_close) if np.isfinite(year_end_close) else 0.0
 
             # 週/月 periods
             wps = wk[(wk["symbol"] == sym) & (wk["year"] == yr)].sort_values("period_end")
             mps = mk[(mk["symbol"] == sym) & (mk["year"] == yr)].sort_values("period_end")
 
-            # 精準週/月：用日K切段加總（全年度）
+            # 精準切段：日K切週/月
             w_logrets = _sum_logret_by_period(daily=d, periods=wps, cutoff_date=None)
             m_logrets = _sum_logret_by_period(daily=d, periods=mps, cutoff_date=None)
 
-            top1_week_share = _topk_share(w_logrets, denom, 1)
-            top4_weeks_share = _topk_share(w_logrets, denom, 4)
-            sum_pos_week_share = _sum_pos_share(w_logrets, denom)
+            worst_week_logret = float(np.nanmin(w_logrets)) if w_logrets.size > 0 else 0.0
+            worst_month_logret = float(np.nanmin(m_logrets)) if m_logrets.size > 0 else 0.0
 
-            top1_month_share = _topk_share(m_logrets, denom, 1)
-            top3_months_share = _topk_share(m_logrets, denom, 3)
-            sum_pos_month_share = _sum_pos_share(m_logrets, denom)
+            # 集中度（POS/NET）
+            top1_week_share_pos = _topk_share_pos(w_logrets, denom_year, 1)
+            top4_weeks_share_pos = _topk_share_pos(w_logrets, denom_year, 4)
+            top1_week_share_net = _topk_share_net(w_logrets, denom_year, 1)
+            top4_weeks_share_net = _topk_share_net(w_logrets, denom_year, 4)
 
-            # peak 前（精準）：直接用日K到 peak_trade_date 的 logret
+            top1_month_share_pos = _topk_share_pos(m_logrets, denom_year, 1)
+            top3_months_share_pos = _topk_share_pos(m_logrets, denom_year, 3)
+            top1_month_share_net = _topk_share_net(m_logrets, denom_year, 1)
+            top3_months_share_net = _topk_share_net(m_logrets, denom_year, 3)
+
+            sum_pos_week_share = _sum_pos_share(w_logrets, denom_year)
+            sum_net_week_share = _sum_net_share(w_logrets, denom_year)
+            sum_pos_month_share = _sum_pos_share(m_logrets, denom_year)
+            sum_net_month_share = _sum_net_share(m_logrets, denom_year)
+
+            # ✅ burst label（你說都來）
+            burst_style_week = "ONE_WEEK_BURST" if top1_week_share_net >= 0.5 else "NON_CONCENTRATED"
+            burst_style_month = "ONE_MONTH_BURST" if top1_month_share_net >= 0.5 else "NON_CONCENTRATED"
+
+            # peak 前：日K到 peak
             logret_to_peak = 0.0
             if peak_trade_date is not None:
                 logret_to_peak = float(d.loc[d["date"] <= peak_trade_date, "d_logret"].sum())
 
-            share_year_to_peak = float(logret_to_peak / denom) if denom > 0 else 0.0
-            # 也給一個「相對 peak」的版本（更貼近你想問：高點前漲停/週月貢獻到高點）
-            denom_peak = peak_logret if peak_logret > 0 else 0.0
-            share_peak_to_peak = float(logret_to_peak / denom_peak) if denom_peak > 0 else 0.0  # 理論上接近 1（但資料/對齊可能有誤差）
+            share_year_to_peak = float(logret_to_peak / denom_year) if denom_year > 0 else 0.0
+            share_peak_to_peak = float(logret_to_peak / denom_peak) if denom_peak > 0 else 0.0
 
-            # peak 前週/月分段 logret 加總（到 peak 為止）
+            # peak 前：週/月切段到 peak
             w_logrets_to_peak = _sum_logret_by_period(daily=d, periods=wps, cutoff_date=peak_trade_date)
             m_logrets_to_peak = _sum_logret_by_period(daily=d, periods=mps, cutoff_date=peak_trade_date)
-            week_log_share_to_peak_vs_year = float(np.nansum(w_logrets_to_peak[w_logrets_to_peak > 0]) / denom) if denom > 0 else 0.0
-            month_log_share_to_peak_vs_year = float(np.nansum(m_logrets_to_peak[m_logrets_to_peak > 0]) / denom) if denom > 0 else 0.0
-            week_log_share_to_peak_vs_peak = float(np.nansum(w_logrets_to_peak[w_logrets_to_peak > 0]) / denom_peak) if denom_peak > 0 else 0.0
-            month_log_share_to_peak_vs_peak = float(np.nansum(m_logrets_to_peak[m_logrets_to_peak > 0]) / denom_peak) if denom_peak > 0 else 0.0
 
-            # peak 前漲停貢獻
+            week_pos_log_share_to_peak_vs_year = float(np.nansum(w_logrets_to_peak[w_logrets_to_peak > 0]) / denom_year) if denom_year > 0 else 0.0
+            week_net_log_share_to_peak_vs_year = float(np.nansum(w_logrets_to_peak[np.isfinite(w_logrets_to_peak)]) / denom_year) if denom_year > 0 else 0.0
+            month_pos_log_share_to_peak_vs_year = float(np.nansum(m_logrets_to_peak[m_logrets_to_peak > 0]) / denom_year) if denom_year > 0 else 0.0
+            month_net_log_share_to_peak_vs_year = float(np.nansum(m_logrets_to_peak[np.isfinite(m_logrets_to_peak)]) / denom_year) if denom_year > 0 else 0.0
+
+            week_pos_log_share_to_peak_vs_peak = float(np.nansum(w_logrets_to_peak[w_logrets_to_peak > 0]) / denom_peak) if denom_peak > 0 else 0.0
+            week_net_log_share_to_peak_vs_peak = float(np.nansum(w_logrets_to_peak[np.isfinite(w_logrets_to_peak)]) / denom_peak) if denom_peak > 0 else 0.0
+            month_pos_log_share_to_peak_vs_peak = float(np.nansum(m_logrets_to_peak[m_logrets_to_peak > 0]) / denom_peak) if denom_peak > 0 else 0.0
+            month_net_log_share_to_peak_vs_peak = float(np.nansum(m_logrets_to_peak[np.isfinite(m_logrets_to_peak)]) / denom_peak) if denom_peak > 0 else 0.0
+
+            # peak 前漲停貢獻（日K logret）
             if peak_trade_date is not None:
                 d_to_peak = d[d["date"] <= peak_trade_date]
             else:
@@ -331,7 +358,7 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
 
             limitup_count_to_peak = int((d_to_peak["is_limit_up"] == 1).sum())
             limitup_log_sum_to_peak = float(d_to_peak.loc[d_to_peak["is_limit_up"] == 1, "d_logret"].sum())
-            limitup_log_share_to_peak_vs_year = float(limitup_log_sum_to_peak / denom) if denom > 0 else 0.0
+            limitup_log_share_to_peak_vs_year = float(limitup_log_sum_to_peak / denom_year) if denom_year > 0 else 0.0
             limitup_log_share_to_peak_vs_peak = float(limitup_log_sum_to_peak / denom_peak) if denom_peak > 0 else 0.0
 
             rows.append(
@@ -345,10 +372,14 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
                     "year_ret_pct": float(r["year_ret_pct"]),
                     "year_logret": year_logret,
 
-                    # 分箱
+                    # bins
                     "year_ret_bin_100": r["year_ret_bin_100"],
                     "year_ret_bin_10_under100": r["year_ret_bin_10_under100"],
                     "year_ret_bin_50_under100": r["year_ret_bin_50_under100"],
+
+                    # ✅ burst style
+                    "burst_style_week": burst_style_week,
+                    "burst_style_month": burst_style_month,
 
                     # peak
                     "year_peak_date_raw": peak_date_raw.strftime("%Y-%m-%d") if pd.notna(peak_date_raw) else None,
@@ -357,25 +388,43 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
                     "peak_close_aligned": peak_close if np.isfinite(peak_close) else np.nan,
                     "peak_logret_from_open": peak_logret,
 
-                    # 週/月集中度（全年度，精準切段）
-                    "top1_week_share": top1_week_share,
-                    "top4_weeks_share": top4_weeks_share,
+                    # 回撤
+                    "year_max_drawdown_log": year_max_dd_log,
+                    "peak_to_year_end_drawdown_log": peak_to_year_end_dd_log,
+                    "worst_week_logret": worst_week_logret,
+                    "worst_month_logret": worst_month_logret,
+
+                    # 週/月集中度（全年）
+                    "top1_week_share_pos": top1_week_share_pos,
+                    "top4_weeks_share_pos": top4_weeks_share_pos,
+                    "top1_week_share_net": top1_week_share_net,
+                    "top4_weeks_share_net": top4_weeks_share_net,
+
+                    "top1_month_share_pos": top1_month_share_pos,
+                    "top3_months_share_pos": top3_months_share_pos,
+                    "top1_month_share_net": top1_month_share_net,
+                    "top3_months_share_net": top3_months_share_net,
+
                     "sum_pos_week_share": sum_pos_week_share,
-
-                    "top1_month_share": top1_month_share,
-                    "top3_months_share": top3_months_share,
+                    "sum_net_week_share": sum_net_week_share,
                     "sum_pos_month_share": sum_pos_month_share,
+                    "sum_net_month_share": sum_net_month_share,
 
-                    # peak 前完成度（用日K精準）
+                    # peak 前完成度
                     "logret_to_peak": logret_to_peak,
                     "share_year_to_peak": share_year_to_peak,
                     "share_peak_to_peak": share_peak_to_peak,
 
-                    # peak 前週/月貢獻（精準切段：加總到 peak）
-                    "week_pos_log_share_to_peak_vs_year": week_log_share_to_peak_vs_year,
-                    "month_pos_log_share_to_peak_vs_year": month_log_share_to_peak_vs_year,
-                    "week_pos_log_share_to_peak_vs_peak": week_log_share_to_peak_vs_peak,
-                    "month_pos_log_share_to_peak_vs_peak": month_log_share_to_peak_vs_peak,
+                    # peak 前週/月貢獻（POS/NET）
+                    "week_pos_log_share_to_peak_vs_year": week_pos_log_share_to_peak_vs_year,
+                    "week_net_log_share_to_peak_vs_year": week_net_log_share_to_peak_vs_year,
+                    "month_pos_log_share_to_peak_vs_year": month_pos_log_share_to_peak_vs_year,
+                    "month_net_log_share_to_peak_vs_year": month_net_log_share_to_peak_vs_year,
+
+                    "week_pos_log_share_to_peak_vs_peak": week_pos_log_share_to_peak_vs_peak,
+                    "week_net_log_share_to_peak_vs_peak": week_net_log_share_to_peak_vs_peak,
+                    "month_pos_log_share_to_peak_vs_peak": month_pos_log_share_to_peak_vs_peak,
+                    "month_net_log_share_to_peak_vs_peak": month_net_log_share_to_peak_vs_peak,
 
                     # 漲停貢獻（peak 前）
                     "limitup_count_to_peak": limitup_count_to_peak,
@@ -390,13 +439,15 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             print("❌ year_contribution 無資料（可能 year/kbar 對不起來或 stock_analysis 缺日K）")
             return {"year_rows": 0, "bin_rows": 0}
 
-        # 寫回 year_contribution（重建）
+        # 寫回 year_contribution
         conn.execute("DROP TABLE IF EXISTS year_contribution")
         out.to_sql("year_contribution", conn, if_exists="replace", index=False)
 
         try:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_symbol_year ON year_contribution(symbol, year)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_bin100 ON year_contribution(year_ret_bin_100)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_burst_week ON year_contribution(burst_style_week)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_burst_month ON year_contribution(burst_style_month)")
         except Exception:
             pass
 
@@ -408,18 +459,33 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
                     "avg_year_ret_pct": float(df["year_ret_pct"].mean()),
                     "median_year_ret_pct": float(df["year_ret_pct"].median()),
 
-                    "avg_top1_week_share": float(df["top1_week_share"].mean()),
-                    "avg_top1_month_share": float(df["top1_month_share"].mean()),
+                    # 集中度（pos/net）
+                    "avg_top1_week_share_pos": float(df["top1_week_share_pos"].mean()),
+                    "avg_top1_week_share_net": float(df["top1_week_share_net"].mean()),
+                    "avg_top1_month_share_pos": float(df["top1_month_share_pos"].mean()),
+                    "avg_top1_month_share_net": float(df["top1_month_share_net"].mean()),
+
+                    # burst 比例
+                    "pct_one_week_burst": float((df["burst_style_week"] == "ONE_WEEK_BURST").mean() * 100),
+                    "pct_one_month_burst": float((df["burst_style_month"] == "ONE_MONTH_BURST").mean() * 100),
+
+                    # peak 完成度
                     "avg_share_year_to_peak": float(df["share_year_to_peak"].mean()),
 
+                    # 漲停貢獻
                     "avg_limitup_count_to_peak": float(df["limitup_count_to_peak"].mean()),
                     "avg_limitup_log_share_to_peak_vs_year": float(df["limitup_log_share_to_peak_vs_year"].mean()),
                     "avg_limitup_log_share_to_peak_vs_peak": float(df["limitup_log_share_to_peak_vs_peak"].mean()),
 
-                    # 你儀表板常會想看的門檻比例（可自行調）
-                    "pct_top1_week_ge_0_4": float((df["top1_week_share"] >= 0.4).mean() * 100),
-                    "pct_top1_month_ge_0_4": float((df["top1_month_share"] >= 0.4).mean() * 100),
+                    # 回撤
+                    "avg_year_max_drawdown_log": float(df["year_max_drawdown_log"].mean()),
+                    "avg_peak_to_year_end_drawdown_log": float(df["peak_to_year_end_drawdown_log"].mean()),
+
+                    # 直覺門檻
+                    "pct_top1_week_net_ge_0_4": float((df["top1_week_share_net"] >= 0.4).mean() * 100),
+                    "pct_top1_month_net_ge_0_4": float((df["top1_month_share_net"] >= 0.4).mean() * 100),
                     "pct_limitup_share_year_ge_0_4": float((df["limitup_log_share_to_peak_vs_year"] >= 0.4).mean() * 100),
+                    "pct_peak_to_year_end_dd_le_m0_2": float((df["peak_to_year_end_drawdown_log"] <= -0.2).mean() * 100),
                 }
             )
 
@@ -434,12 +500,10 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
 
         conn.commit()
 
-        print("\n✅ kbar_contribution（精準切段版）完成：")
+        print("\n✅ kbar_contribution（精準切段｜都來）完成：")
         print(f"📌 year_contribution rows: {len(out):,}")
         print(f"📌 year_contribution_bins rows: {len(bins):,}")
-        print("📌 週/月集中度：top1_week_share / top1_month_share")
-        print("📌 peak 前完成度：share_year_to_peak（到年高點已完成全年漲幅比例）")
-        print("📌 漲停貢獻：limitup_log_share_to_peak_vs_year / vs_peak")
+        print("📌 burst labels：burst_style_week / burst_style_month 已加入")
 
         return {"year_rows": int(len(out)), "bin_rows": int(len(bins))}
 
@@ -452,5 +516,4 @@ if __name__ == "__main__":
         print("Usage: python kbar_contribution.py <db_path>")
         sys.exit(1)
 
-    db = sys.argv[1]
-    build_contribution_tables(db_path=db)
+    build_contribution_tables(sys.argv[1])
