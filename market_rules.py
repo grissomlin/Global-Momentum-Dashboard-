@@ -1,430 +1,497 @@
-# market_rules.py
 # -*- coding: utf-8 -*-
 """
 market_rules.py
 ---------------
-跨市場「制度漲跌幅 / 漲停(Stop High)」與「研究口徑(>=10%分箱)」規則集中管理
+全球市場規則集中管理（給 Global-Momentum-Dashboard- / processor.py 使用）
 
-✅ 目的
-1) 把各市場制度規則從 processor.py 抽離，避免 processor 越長越難維護
-2) 同時支援兩種口徑：
-   - regulatory / exchange rule：制度漲停(台灣10%、韓國30%、日本值幅制限；美/港無固定漲跌幅)
-   - research / custom rule：你要的「>=10% 當類漲停」+「10%為步長分箱到>=100%」
+✅ 支援市場：
+- TW：上市/上櫃(±10%)、興櫃(無漲跌幅限制)
+- CN：主板(±10%)、創業板ChiNext(±20%)、科創板STAR(±20%)  ※ ST(±5%)暫未細分
+- JP：日股動態漲跌停（金額制 -> 動態百分比），支援 Stop High / Stop Low 計算
+- KR：KOSPI/KOSDAQ(±30%)
+- US/HK：無固定漲跌幅限制（但可用統一強勢分箱統計）
 
-✅ 注意
-- US: 無固定漲跌幅(有 LULD/熔斷，但不是固定每日±X%) → 在此以 limit_up_pct=None 表示
-- HK: 無固定漲跌幅(有 VCM 冷靜期，但不是固定每日±X%) → limit_up_pct=None
-- JP: 値幅制限是「依前日收盤價區間，限制日圓幅度」→ 用 jp_limit_yen(prev_close) 計算
+✅ 你額外要的功能：
+- 統一強勢分箱：10%以上每 10% 一箱直到 100%+
+- 漲停開盤型態分類（GAP_UP / FLOATING / HIGH_VOLUME_LOCK / NO_VOLUME_LOCK / OTHER）
+- 隔日衝 / 衝板失敗 / 昨日漲停今日未漲 等 flags 計算工具
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Dict, List, Tuple, Optional, Any
 
-import math
+import numpy as np
+import pandas as pd
 
 
 # =========================================================
-# 1) Rule dataclass
+# 0) 共用：強勢分箱（10% 起跳，每 10% 一區間，到 100%+）
+# =========================================================
+def build_strength_intervals_10_to_100() -> List[Tuple[int, str]]:
+    """
+    產生：
+      10-20, 20-30, ... 90-100, 100UP
+    注意：返回值是 (min_val, label)
+      - label 為 RANK_10_20 / RANK_20_30 ... / RANK_100UP
+      - 你 processor.py 目前的 label_detailed_strength 是由 intervals 推導 next_min
+    """
+    intervals: List[Tuple[int, str]] = []
+    for x in range(10, 100, 10):
+        intervals.append((x, f"RANK_{x}_{x+10}"))
+    intervals.append((100, "RANK_100UP"))
+    return intervals
+
+
+# =========================================================
+# 1) 日本：動態漲跌停金額制（簡化常見區間版本）
+#    來源表格你之前貼的那份「常見區間整理」，可再補完整表也很容易。
+# =========================================================
+def jp_limit_amount(prev_close: float) -> Optional[float]:
+    """
+    回傳：當日允許最大漲跌「金額（日圓）」(±amount)
+
+    注意：
+    - 日本正式表格更完整（還有更多價位區間）
+    - 這裡先用你貼的常見區間（夠用於大部分股票）
+    - 若遇到極端高價股不在區間內，會回傳 None（你可自行擴表）
+    """
+    if prev_close is None or not np.isfinite(prev_close) or prev_close <= 0:
+        return None
+
+    p = float(prev_close)
+
+    # 常見區間（可擴充）
+    # [low, high] -> amount
+    table = [
+        (0, 100, 30),
+        (100, 200, 50),
+        (200, 500, 80),
+        (500, 700, 100),
+        (700, 1000, 150),
+        (1000, 1500, 300),
+        (1500, 2000, 400),
+        (2000, 3000, 500),
+        (3000, 5000, 700),
+        (5000, 7000, 1000),
+        (7000, 10000, 1500),
+        (10000, 15000, 3000),
+        (15000, 20000, 4000),
+        (20000, 30000, 5000),
+        (30000, 50000, 7000),
+        (50000, 70000, 10000),
+        (70000, 100000, 15000),
+        (100000, 150000, 30000),
+        (150000, 200000, 40000),
+        (200000, 300000, 50000),
+    ]
+
+    for low, high, amt in table:
+        # 依你表格的語意：100～199 是 [100,200)
+        if low <= p < high:
+            return float(amt)
+
+    # 超出範圍 -> 先回 None（你可以自行擴表）
+    return None
+
+
+def jp_limit_up_price(prev_close: float) -> Optional[float]:
+    amt = jp_limit_amount(prev_close)
+    if amt is None:
+        return None
+    # 日本是「金額」限制；實務上報價最小跳動單位也會影響，但你做日線回測可先忽略 tick
+    return float(prev_close) + float(amt)
+
+
+def jp_limit_down_price(prev_close: float) -> Optional[float]:
+    amt = jp_limit_amount(prev_close)
+    if amt is None:
+        return None
+    return float(prev_close) - float(amt)
+
+
+def jp_limit_up_pct(prev_close: float) -> Optional[float]:
+    """
+    回傳動態漲停「百分比」(例如 0.15)
+    """
+    amt = jp_limit_amount(prev_close)
+    if amt is None or prev_close is None or prev_close <= 0:
+        return None
+    return float(amt) / float(prev_close)
+
+
+# =========================================================
+# 2) MarketConfig：各市場規則
 # =========================================================
 @dataclass(frozen=True)
 class MarketRule:
     """
-    market: 建議用 'TW','KR','JP','US','HK','CN' 等大寫
-    market_detail: 例如 'listed','otc','emerging','kosdaq','kospi' 等
-    limit_up_pct:   固定百分比漲停（TW=0.10, KR=0.30；US/HK=None；JP=None 走日圓表）
-    strong_threshold: processor 用的「強勢日」門檻（你想要 TW=10%、KR=30%、TW emerging=20% 等）
-    custom_limit_up_pct: 你研究口徑的統一「>=10% 當類漲停」
+    統一規則結構
+
+    limit_mode:
+      - "pct": 固定百分比漲跌幅限制（TW/CN/KR）
+      - "none": 無固定漲跌幅（US/HK/TW興櫃）
+      - "jp_amount": 日本金額制（需要 prev_close 才能算）
     """
-    market: str
-    market_detail: str = ""
-    limit_up_pct: Optional[float] = None
-    limit_down_pct: Optional[float] = None
-    strong_threshold: float = 0.10
-    custom_limit_up_pct: float = 0.10
-
-    # 你要的「分箱」設定：>=10% 起，每 10% 一格，直到 >=100%
-    # 這是研究口徑，不等於交易所制度
-    bin_step_pct: int = 10
-    bin_start_pct: int = 10
-    bin_max_pct: int = 100
+    limit_mode: str
+    limit_up_pct: Optional[float]          # 若 limit_mode="pct" 才會用到
+    threshold: float                       # 強勢日門檻（用於年度巔峰貢獻等）
+    strength_intervals: List[Tuple[int, str]]
+    max_strength: int
 
 
-# =========================================================
-# 2) Market rule resolver
-# =========================================================
-def normalize_market(market: str) -> str:
-    if market is None:
-        return ""
-    s = str(market).strip().upper()
-    # downloader 有時會寫 KOSPI/KOSDAQ 到 market 欄位
-    if s in ("KOSPI", "KOSDAQ"):
-        return "KR"
-    if s in ("HKEX",):
-        return "HK"
-    return s
-
-
-def normalize_detail(detail: str) -> str:
-    if detail is None:
-        return ""
-    return str(detail).strip().lower()
-
-
-def get_rule(market: str, market_detail: str = "") -> MarketRule:
+class MarketConfig:
     """
-    統一入口：根據 stock_info.market / stock_info.market_detail 決定規則
+    市場配置類別，統一管理不同市場規則
+    - 你 processor.py 只要讀這裡回傳的 dict 就能跑
+    - 日本的 dynamic limit：用 limit_mode="jp_amount"
     """
-    m = normalize_market(market)
-    d = normalize_detail(market_detail)
 
-    # -----------------------------
-    # Taiwan
-    # -----------------------------
-    if m == "TW":
-        # 興櫃：無固定漲跌幅限制（實務上有撮合限制等，但不等同固定±10%），你的 processor 也把它當 unrestricted
-        if d in ("emerging", "emg", "emerging_board"):
-            return MarketRule(
-                market="TW",
-                market_detail="emerging",
-                limit_up_pct=None,
-                limit_down_pct=None,
-                strong_threshold=0.20,   # 你原本的設定
-                custom_limit_up_pct=0.10
-            )
+    # 統一分箱（你說美/港要用、也想讓日本也有）
+    INTERVALS_10_100 = build_strength_intervals_10_to_100()
 
-        # 上市/上櫃：固定 10%
-        if d in ("listed", "tse", "twse"):
-            return MarketRule(
-                market="TW",
-                market_detail=d,
-                limit_up_pct=0.10,
-                limit_down_pct=0.10,
-                strong_threshold=0.10,
-                custom_limit_up_pct=0.10
-            )
-
-        if d in ("otc", "gtsm", "tpex"):
-            return MarketRule(
-                market="TW",
-                market_detail=d,
-                limit_up_pct=0.10,
-                limit_down_pct=0.10,
-                strong_threshold=0.10,
-                custom_limit_up_pct=0.10
-            )
-
-        # fallback: 當上市處理
-        return MarketRule(
-            market="TW",
-            market_detail=d,
+    MARKET_RULES: Dict[str, MarketRule] = {
+        # -----------------------------
+        # Taiwan
+        # -----------------------------
+        "TW_LISTED": MarketRule(
+            limit_mode="pct",
             limit_up_pct=0.10,
-            limit_down_pct=0.10,
-            strong_threshold=0.10,
-            custom_limit_up_pct=0.10
-        )
+            threshold=0.10,
+            strength_intervals=[(10, "RANK_10UP")],
+            max_strength=10,
+        ),
+        "TW_OTC": MarketRule(
+            limit_mode="pct",
+            limit_up_pct=0.10,
+            threshold=0.10,
+            strength_intervals=[(10, "RANK_10UP")],
+            max_strength=10,
+        ),
+        "TW_EMERGING": MarketRule(
+            limit_mode="none",
+            limit_up_pct=None,
+            threshold=0.20,
+            strength_intervals=INTERVALS_10_100,
+            max_strength=100,
+        ),
 
-    # -----------------------------
-    # Korea (KOSPI/KOSDAQ): 30%
-    # -----------------------------
-    if m == "KR":
-        # 你 downloader_kr 裡 market_detail 有 main/kosdaq/konex
-        # processor 目前只特化 kospi/kosdaq；konex 先當 kosdaq 或 kospi 都行
-        if "kosdaq" in d:
-            md = "kosdaq"
-        elif "kospi" in d or d == "main":
-            md = "kospi"
-        elif "konex" in d:
-            md = "konex"
-        else:
-            md = d or "kospi"
-
-        return MarketRule(
-            market="KR",
-            market_detail=md,
+        # -----------------------------
+        # Korea
+        # -----------------------------
+        "KR_KOSPI": MarketRule(
+            limit_mode="pct",
             limit_up_pct=0.30,
-            limit_down_pct=0.30,
-            strong_threshold=0.30,  # 你原本的設定
-            custom_limit_up_pct=0.10
-        )
+            threshold=0.30,
+            strength_intervals=[(10, "RANK_10_20"), (20, "RANK_20_30"), (30, "RANK_30UP")],
+            max_strength=30,
+        ),
+        "KR_KOSDAQ": MarketRule(
+            limit_mode="pct",
+            limit_up_pct=0.30,
+            threshold=0.30,
+            strength_intervals=[(10, "RANK_10_20"), (20, "RANK_20_30"), (30, "RANK_30UP")],
+            max_strength=30,
+        ),
 
-    # -----------------------------
-    # Japan: 値幅制限(以日圓計算)
-    # -----------------------------
-    if m == "JP":
-        return MarketRule(
-            market="JP",
-            market_detail=d or "tse",
-            limit_up_pct=None,      # 用日圓表
-            limit_down_pct=None,    # 用日圓表
-            strong_threshold=0.10,  # 研究用強勢日；你也可改成更高
-            custom_limit_up_pct=0.10
-        )
+        # -----------------------------
+        # China A-share
+        # 主板：10%
+        # 創業板 / 科創板：20%
+        # -----------------------------
+        "CN_MAIN": MarketRule(
+            limit_mode="pct",
+            limit_up_pct=0.10,
+            threshold=0.10,
+            strength_intervals=INTERVALS_10_100,
+            max_strength=100,
+        ),
+        "CN_CHINEXT": MarketRule(
+            limit_mode="pct",
+            limit_up_pct=0.20,
+            threshold=0.20,
+            strength_intervals=INTERVALS_10_100,
+            max_strength=100,
+        ),
+        "CN_STAR": MarketRule(
+            limit_mode="pct",
+            limit_up_pct=0.20,
+            threshold=0.20,
+            strength_intervals=INTERVALS_10_100,
+            max_strength=100,
+        ),
 
-    # -----------------------------
-    # US / HK: no fixed daily pct limit
-    # -----------------------------
-    if m == "US":
-        return MarketRule(
-            market="US",
-            market_detail=d,
+        # -----------------------------
+        # Japan (JPX / TSE)
+        # 動態金額制（以 prev_close 計算）
+        # -----------------------------
+        "JP_TSE": MarketRule(
+            limit_mode="jp_amount",
             limit_up_pct=None,
-            limit_down_pct=None,
-            strong_threshold=0.10,
-            custom_limit_up_pct=0.10
-        )
+            threshold=0.10,                 # 你要統一做 10%+ 分箱，threshold 也可先用 10%
+            strength_intervals=INTERVALS_10_100,
+            max_strength=100,
+        ),
 
-    if m == "HK":
-        return MarketRule(
-            market="HK",
-            market_detail=d,
+        # -----------------------------
+        # US / HK (no fixed limit)
+        # -----------------------------
+        "US": MarketRule(
+            limit_mode="none",
             limit_up_pct=None,
-            limit_down_pct=None,
-            strong_threshold=0.10,
-            custom_limit_up_pct=0.10
-        )
-
-    # -----------------------------
-    # CN: 一般 A 股有 10%/20% 等限制但牽涉 ST/創業板/科創板等細節
-    # 先保守：不在這裡硬編（避免錯），等你要做再補齊
-    # -----------------------------
-    if m == "CN":
-        return MarketRule(
-            market="CN",
-            market_detail=d,
+            threshold=0.10,
+            strength_intervals=INTERVALS_10_100,
+            max_strength=100,
+        ),
+        "HK": MarketRule(
+            limit_mode="none",
             limit_up_pct=None,
-            limit_down_pct=None,
-            strong_threshold=0.10,
-            custom_limit_up_pct=0.10
-        )
+            threshold=0.10,
+            strength_intervals=INTERVALS_10_100,
+            max_strength=100,
+        ),
+    }
 
-    # fallback
-    return MarketRule(
-        market=m or "UNKNOWN",
-        market_detail=d,
-        limit_up_pct=None,
-        limit_down_pct=None,
-        strong_threshold=0.10,
-        custom_limit_up_pct=0.10
-    )
+    @classmethod
+    def get_market_config(cls, market: str, market_detail: str) -> MarketRule:
+        """
+        market / market_detail 來自 stock_info：
+          - TW: market="TW", market_detail in listed/otc/emerging
+          - CN: market in SSE/SZSE, market_detail in main/chinext/star
+          - JP: market="JP" or "TSE", market_detail="tse"
+          - HK: market="HK" or "HKEX"
+          - US: market="US" or exchange strings
+          - KR: market contains KOSPI/KOSDAQ
+        """
+        m = (market or "").upper()
+        d = (market_detail or "").lower()
+
+        # ---- Taiwan ----
+        if m == "TW":
+            if d == "emerging":
+                return cls.MARKET_RULES["TW_EMERGING"]
+            if d in ("listed", "tse"):
+                return cls.MARKET_RULES["TW_LISTED"]
+            if d in ("otc", "gtsm"):
+                return cls.MARKET_RULES["TW_OTC"]
+            return cls.MARKET_RULES["TW_LISTED"]
+
+        # ---- Korea ----
+        if m == "KR" or ("KOSPI" in m) or ("KOSDAQ" in m) or ("KOSPI" in d.upper()) or ("KOSDAQ" in d.upper()):
+            if "KOSDAQ" in m or "kosdaq" in d:
+                return cls.MARKET_RULES["KR_KOSDAQ"]
+            return cls.MARKET_RULES["KR_KOSPI"]
+
+        # ---- China ----
+        if m in ("SSE", "SZSE", "CN"):
+            if d in ("chinext", "cyb", "创业板"):
+                return cls.MARKET_RULES["CN_CHINEXT"]
+            if d in ("star", "kcb", "科创板"):
+                return cls.MARKET_RULES["CN_STAR"]
+            return cls.MARKET_RULES["CN_MAIN"]
+
+        # ---- Japan ----
+        if m in ("JP", "TSE", "JPX") or d in ("tse", "jpx"):
+            return cls.MARKET_RULES["JP_TSE"]
+
+        # ---- Hong Kong ----
+        if m in ("HK", "HKEX") or d in ("hkex", "hk"):
+            return cls.MARKET_RULES["HK"]
+
+        # ---- US ----
+        if m in ("US", "NASDAQ", "NYSE", "AMEX"):
+            return cls.MARKET_RULES["US"]
+
+        # fallback：用 US 規則（無固定漲停，但保留分箱）
+        return cls.MARKET_RULES["US"]
 
 
 # =========================================================
-# 3) Japan (JPX/TSE) price limit table (値幅制限)
+# 3) 共用：計算漲停價 / 是否漲停 / 是否摸到漲停（含日本動態）
 # =========================================================
-# 値幅制限：依「前日收盤價」決定當日允許的「日圓」漲跌幅度
-# 這裡給的是「常用」表格（已涵蓋大多數價格帶），足夠做制度漲停/跌停判斷。
-#
-# 格式：(upper_bound_inclusive, limit_yen)
-# 例如 prev_close <= 100 → ±30 yen
-#
-# 你之後若要「完全對齊官方最新表」，只要換這張表即可，不用動 processor。
-_JP_LIMIT_TABLE: List[Tuple[float, int]] = [
-    (100, 30),
-    (200, 50),
-    (500, 80),
-    (700, 100),
-    (1000, 150),
-    (1500, 300),
-    (2000, 400),
-    (3000, 500),
-    (5000, 700),
-    (7000, 1000),
-    (10000, 1500),
-    (15000, 3000),
-    (20000, 4000),
-    (30000, 5000),
-    (50000, 7000),
-    (70000, 10000),
-    (100000, 15000),
-    (150000, 30000),
-    (200000, 40000),
-    (300000, 50000),
-    (500000, 70000),
-    (700000, 100000),
-    (1000000, 150000),
-    (1500000, 300000),
-    (2000000, 400000),
-    (3000000, 500000),
-    (5000000, 700000),
-    (7000000, 1000000),
-    (10000000, 1500000),
-    (15000000, 3000000),
-    (20000000, 4000000),
-    (30000000, 5000000),
-    (50000000, 7000000),
-]
+def calc_limit_up_price(prev_close: float, rule: MarketRule) -> Optional[float]:
+    if prev_close is None or not np.isfinite(prev_close) or prev_close <= 0:
+        return None
+
+    if rule.limit_mode == "pct":
+        if rule.limit_up_pct is None:
+            return None
+        # 你 processor 目前 round 到 2 位；這裡不強制，交給 processor 或你自行決定
+        return float(prev_close) * (1.0 + float(rule.limit_up_pct))
+
+    if rule.limit_mode == "jp_amount":
+        return jp_limit_up_price(prev_close)
+
+    # none
+    return None
 
 
-def jp_limit_yen(prev_close: float) -> int:
+def is_limit_up_day(close: float, prev_close: float, rule: MarketRule, tol: float = 0.999) -> int:
     """
-    回傳日本市場該檔在 prev_close 下的「制度」漲跌幅限制（日圓）
+    close 是否達到漲停價（可用 tol 放寬）
     """
-    try:
-        if prev_close is None:
-            return 0
-        p = float(prev_close)
-        if not math.isfinite(p) or p <= 0:
-            return 0
-    except Exception:
+    lp = calc_limit_up_price(prev_close, rule)
+    if lp is None or close is None or not np.isfinite(close):
         return 0
-
-    for upper, lim in _JP_LIMIT_TABLE:
-        if p <= upper:
-            return lim
-
-    # 超出最高區間時給一個很大的值（保底）
-    return _JP_LIMIT_TABLE[-1][1]
+    return int(float(close) >= float(lp) * tol)
 
 
-def jp_limit_prices(prev_close: float) -> Tuple[float, float]:
+def hit_limit_up_intraday(high: float, prev_close: float, rule: MarketRule, tol: float = 0.999) -> int:
     """
-    回傳 (limit_up_price, limit_down_price)
+    high 是否盤中摸到漲停價（用於「衝板失敗」）
     """
-    lim = jp_limit_yen(prev_close)
-    try:
-        p = float(prev_close)
-        return p + lim, p - lim
-    except Exception:
-        return (0.0, 0.0)
+    lp = calc_limit_up_price(prev_close, rule)
+    if lp is None or high is None or not np.isfinite(high):
+        return 0
+    return int(float(high) >= float(lp) * tol)
 
 
 # =========================================================
-# 4) Research bins (>=10%, step=10%, to >=100%)
+# 4) 漲停開盤型態分類（你的文章那套）
+#    注意：日線 OHLC 沒有分鐘級資料，所以「盤中逐步推升」只能用 close/open 近似。
 # =========================================================
-def label_change_bin_10pct(
-    daily_change: float,
-    bin_start_pct: int = 10,
-    bin_step_pct: int = 10,
-    bin_max_pct: int = 100,
+def classify_limit_open_type(
+    open_px: float,
+    high_px: float,
+    close_px: float,
+    prev_close: float,
+    volume: float,
+    vol_ma5: float,
+    is_limit_up: int,
+    rule: MarketRule,
 ) -> str:
     """
-    研究口徑：把 daily_change(小數) 依「10%步長」做分箱：
-    - chg < 0         → NEGATIVE
-    - 0 ~ <10         → POS_0_10
-    - 10 ~ <20        → POS_10_20
-    ...
-    - 90 ~ <100       → POS_90_100
-    - >=100           → POS_100UP
+    回傳：
+      GAP_UP / FLOATING / HIGH_VOLUME_LOCK / NO_VOLUME_LOCK / OTHER
+
+    依你定義的中間判斷：
+      is_gap     = (open/prev_close - 1) >= 0.07
+      is_highvol = (volume/vol_ma5) >= 3
+      is_lowvol  = (volume/vol_ma5) <= 0.4
+      is_float   = (not is_gap) and (close/open - 1 >= 0.05)
+
+    最終優先序（你給的）：
+      GAP_UP_LOCK   ：is_gap 且 is_low_vol
+      GAP_UP        ：is_gap 且 非 is_low_vol
+      FLOAT_HV      ：is_float 且 is_high_vol
+      FLOAT         ：is_float 且 非 is_high_vol
+      LOW_VOL_LOCK  ：is_low_vol
+      HIGH_VOL_LOCK ：is_high_vol
+      OTHER
+
+    然後你要合併成四大類：
+      FLOATING / GAP_UP / OTHER / HIGH_VOLUME_LOCK / NO_VOLUME_LOCK
     """
-    try:
-        if daily_change is None:
-            return "NA"
-        chg = float(daily_change) * 100.0
-        if not math.isfinite(chg):
-            return "NA"
-    except Exception:
-        return "NA"
+    # 基礎防呆
+    if prev_close is None or not np.isfinite(prev_close) or prev_close <= 0:
+        return "OTHER"
+    if open_px is None or not np.isfinite(open_px) or open_px <= 0:
+        return "OTHER"
+    if close_px is None or not np.isfinite(close_px) or close_px <= 0:
+        return "OTHER"
 
-    if chg < 0:
-        return "NEGATIVE"
-    if chg < bin_start_pct:
-        return f"POS_0_{bin_start_pct}"
+    vr = None
+    if vol_ma5 is not None and np.isfinite(vol_ma5) and vol_ma5 > 0 and volume is not None and np.isfinite(volume):
+        vr = float(volume) / float(vol_ma5)
 
-    if chg >= bin_max_pct:
-        return f"POS_{bin_max_pct}UP"
+    is_gap = (float(open_px) / float(prev_close) - 1.0) >= 0.07
+    is_high_vol = (vr is not None) and (vr >= 3.0)
+    is_low_vol = (vr is not None) and (vr <= 0.4)
+    is_float = (not is_gap) and ((float(close_px) / float(open_px) - 1.0) >= 0.05)
 
-    lo = int(chg // bin_step_pct) * bin_step_pct
-    hi = lo + bin_step_pct
-    # 確保下界至少從 bin_start_pct 開始
-    if lo < bin_start_pct:
-        lo = bin_start_pct
-        hi = lo + bin_step_pct
-    return f"POS_{lo}_{hi}"
+    # 先走你那套 7 類，再合併
+    if is_gap and is_low_vol:
+        fine = "GAP_UP_LOCK"
+    elif is_gap and (not is_low_vol):
+        fine = "GAP_UP"
+    elif is_float and is_high_vol:
+        fine = "FLOAT_HV"
+    elif is_float and (not is_high_vol):
+        fine = "FLOAT"
+    elif is_low_vol:
+        fine = "LOW_VOL_LOCK"
+    elif is_high_vol:
+        fine = "HIGH_VOL_LOCK"
+    else:
+        fine = "OTHER"
 
-
-def is_custom_limit_up(daily_change: float, custom_limit_up_pct: float = 0.10) -> int:
-    """
-    研究口徑：>=10% 當類漲停
-    """
-    try:
-        if daily_change is None:
-            return 0
-        return int(float(daily_change) >= float(custom_limit_up_pct))
-    except Exception:
-        return 0
+    # 合併
+    if fine in ("FLOAT", "FLOAT_HV"):
+        return "FLOATING"
+    if fine in ("GAP_UP", "GAP_UP_LOCK"):
+        return "GAP_UP"
+    if fine == "HIGH_VOL_LOCK":
+        return "HIGH_VOLUME_LOCK"
+    if fine == "LOW_VOL_LOCK":
+        return "NO_VOLUME_LOCK"
+    return "OTHER"
 
 
 # =========================================================
-# 5) Regulatory limit-up / limit-down evaluator
+# 5) 隔日衝 / 衝板失敗等 flags（給你做統計用）
 # =========================================================
-def calc_reg_limit_flags(
-    market: str,
-    market_detail: str,
-    prev_close: float,
-    close: float,
-    price_round: Optional[int] = 2,
-    eps: float = 0.001,
-) -> Dict[str, Any]:
+def add_daytrade_flags(df: pd.DataFrame, rule: MarketRule) -> pd.DataFrame:
     """
-    計算「制度」漲停/跌停旗標（regulatory）
-    回傳 dict：
-      - is_limit_up_reg
-      - is_limit_down_reg
-      - limit_up_price_reg
-      - limit_down_price_reg
-      - reg_rule_type: 'PCT' | 'JPY' | 'NONE'
+    需要 df 至少包含：
+      open, high, close, volume
+    並且要先有：
+      prev_close (= close.shift(1))
+      vol_ma5 (= volume.rolling(5).mean())
+    建議在 processor.py 內 group-by symbol 後先補好 prev_close/vol_ma5，再呼叫此函式。
+
+    會新增欄位：
+      limit_up_price         : 當日漲停價（若 market 無固定漲停則為 NaN）
+      hit_limit_up           : 盤中是否摸到漲停
+      is_limit_up            : 收盤是否漲停（鎖住）
+      fail_limit_up          : 盤中摸到漲停但收盤沒鎖（衝板失敗）
+      yday_is_limit_up       : 昨天是否漲停
+      yday_limit_today_not   : 昨天漲停、今天沒漲停（隔日衝常用觀察）
+      yday_not_limit_today_fail : 昨天沒漲停、今天衝板失敗
+      limit_open_type        : 漲停開盤型態（五類）
     """
-    rule = get_rule(market, market_detail)
+    out = df.copy()
 
-    # 基礎容錯
-    try:
-        pc = float(prev_close) if prev_close is not None else float("nan")
-        cc = float(close) if close is not None else float("nan")
-        if not (math.isfinite(pc) and math.isfinite(cc)) or pc <= 0:
-            return {
-                "is_limit_up_reg": 0,
-                "is_limit_down_reg": 0,
-                "limit_up_price_reg": None,
-                "limit_down_price_reg": None,
-                "reg_rule_type": "NONE",
-            }
-    except Exception:
-        return {
-            "is_limit_up_reg": 0,
-            "is_limit_down_reg": 0,
-            "limit_up_price_reg": None,
-            "limit_down_price_reg": None,
-            "reg_rule_type": "NONE",
-        }
+    # 先算當日漲停價（可能為 None）
+    def _limit_price_row(r):
+        pc = r.get("prev_close")
+        return calc_limit_up_price(pc, rule) if pc is not None else None
 
-    # JP: yen table
-    if rule.market == "JP":
-        up, down = jp_limit_prices(pc)
-        if price_round is not None:
-            up = round(up, price_round)
-            down = round(down, price_round)
+    out["limit_up_price"] = out.apply(_limit_price_row, axis=1)
 
-        return {
-            "is_limit_up_reg": int(cc >= up * (1 - eps)),
-            "is_limit_down_reg": int(cc <= down * (1 + eps)),
-            "limit_up_price_reg": up,
-            "limit_down_price_reg": down,
-            "reg_rule_type": "JPY",
-        }
+    # hit / close
+    out["hit_limit_up"] = out.apply(
+        lambda r: hit_limit_up_intraday(r.get("high"), r.get("prev_close"), rule),
+        axis=1,
+    )
+    out["is_limit_up"] = out.apply(
+        lambda r: is_limit_up_day(r.get("close"), r.get("prev_close"), rule),
+        axis=1,
+    )
 
-    # TW/KR fixed pct
-    if rule.limit_up_pct is not None:
-        up = pc * (1 + rule.limit_up_pct)
-        down = pc * (1 - (rule.limit_down_pct if rule.limit_down_pct is not None else rule.limit_up_pct))
-        if price_round is not None:
-            up = round(up, price_round)
-            down = round(down, price_round)
+    # 衝板失敗：摸到漲停但收盤沒鎖
+    out["fail_limit_up"] = ((out["hit_limit_up"] == 1) & (out["is_limit_up"] == 0)).astype(int)
 
-        return {
-            "is_limit_up_reg": int(cc >= up * (1 - eps)),
-            "is_limit_down_reg": int(cc <= down * (1 + eps)),
-            "limit_up_price_reg": up,
-            "limit_down_price_reg": down,
-            "reg_rule_type": "PCT",
-        }
+    # 昨日漲停 / 昨日漲停今日未漲停
+    out["yday_is_limit_up"] = out["is_limit_up"].shift(1).fillna(0).astype(int)
+    out["yday_limit_today_not"] = ((out["yday_is_limit_up"] == 1) & (out["is_limit_up"] == 0)).astype(int)
 
-    # US/HK etc: none
-    return {
-        "is_limit_up_reg": 0,
-        "is_limit_down_reg": 0,
-        "limit_up_price_reg": None,
-        "limit_down_price_reg": None,
-        "reg_rule_type": "NONE",
-    }
+    # 昨天沒漲停，但今天衝板失敗
+    out["yday_not_limit_today_fail"] = ((out["yday_is_limit_up"] == 0) & (out["fail_limit_up"] == 1)).astype(int)
+
+    # 漲停開盤型態（就算不是漲停日，也可以給 OTHER）
+    out["limit_open_type"] = out.apply(
+        lambda r: classify_limit_open_type(
+            open_px=r.get("open"),
+            high_px=r.get("high"),
+            close_px=r.get("close"),
+            prev_close=r.get("prev_close"),
+            volume=r.get("volume"),
+            vol_ma5=r.get("vol_ma5"),
+            is_limit_up=int(r.get("is_limit_up", 0)),
+            rule=rule,
+        ),
+        axis=1,
+    )
+
+    return out
