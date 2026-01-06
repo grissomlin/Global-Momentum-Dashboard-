@@ -11,10 +11,10 @@ A 股資料下載器（與 Global-Momentum-Dashboard- main.py / processor.py 相
 ✅ 增量下載：依 stock_prices 的 MAX(date) 決定每檔實際開始日
 ✅ akshare 取 A 股名單（若環境無 akshare，會 fallback 不讓流程直接炸）
 ✅ 下載失敗寫入 download_errors（不洗版）
-✅ ✅ 新增：market_detail 精準分類（main / chinext / star）
-   - main: 主板 ±10%
-   - chinext: 創業板(300/301) ±20%
-   - star: 科創板(688) ±20%
+✅ 市場細分（重點！）：
+   - main(±10%)：主板/中小板（000/001/002/003/600/601/603/605）
+   - chinext(±20%)：創業板（300/301）
+   - star(±20%)：科創板（688）
 """
 
 import os
@@ -85,7 +85,6 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_symbol ON stock_prices(symbol)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_date ON stock_prices(date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_info_market ON stock_info(market)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_info_market_detail ON stock_info(market_detail)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_err_symbol ON download_errors(symbol)")
         conn.commit()
     finally:
@@ -108,30 +107,30 @@ def load_last_dates_map() -> dict:
         conn.close()
 
 
-# ========== 3) A 股板塊分類（關鍵：給 market_detail） ==========
-def classify_cn_by_code(code6: str):
+# ========== 3) 市場細分（重點：決定 10% vs 20%） ==========
+def _classify_cn_market(symbol: str):
     """
+    symbol 形如 600000.SS / 000001.SZ / 300001.SZ / 688001.SS
     回傳 (market, market_detail)
-    market: SSE / SZSE
-    market_detail:
-      - 'main'    主板/中小板/其他先歸主板制度（±10%）
-      - 'chinext' 創業板（300/301）±20%
-      - 'star'    科創板（688）±20%
     """
-    code6 = str(code6).zfill(6)
+    # 抽出 6 碼
+    code = str(symbol).split(".")[0].zfill(6)
 
-    # 科創板
-    if code6.startswith("688"):
+    # 科創板 STAR：688xxx (SSE)
+    if code.startswith("688"):
         return "SSE", "star"
 
-    # 創業板
-    if code6.startswith(("300", "301")):
+    # 創業板 ChiNext：300xxx / 301xxx (SZSE)
+    if code.startswith("300") or code.startswith("301"):
         return "SZSE", "chinext"
 
-    # 其他：主板/中小板
-    if code6.startswith("6"):
+    # 其餘先視為 main（主板/中小）
+    if symbol.endswith(".SS"):
         return "SSE", "main"
-    return "SZSE", "main"
+    if symbol.endswith(".SZ"):
+        return "SZSE", "main"
+
+    return "CN", "unknown"
 
 
 # ========== 4) 取得 A 股清單 ==========
@@ -142,14 +141,14 @@ def get_cn_stock_list():
     """
     log("📡 正在獲取 A 股清單...")
 
-    # 1) 優先使用 akshare（名單最完整）
+    # 1) 優先使用 akshare
     try:
         import akshare as ak
 
         df_spot = ak.stock_zh_a_spot_em()
 
         valid_prefixes = (
-            "000", "001", "002", "003",  # 深市主板/中小板
+            "000", "001", "002", "003",  # 深市主板/中小
             "300", "301",                # 創業板
             "600", "601", "603", "605",  # 滬市主板
             "688",                       # 科創板
@@ -163,12 +162,10 @@ def get_cn_stock_list():
                 if not code.startswith(valid_prefixes):
                     continue
 
-                market, market_detail = classify_cn_by_code(code)
-                symbol = f"{code}.SS" if market == "SSE" else f"{code}.SZ"
-
+                symbol = f"{code}.SS" if code.startswith("6") else f"{code}.SZ"
+                market, market_detail = _classify_cn_market(symbol)
                 name = str(row.get("名称", "Unknown")).strip() or "Unknown"
 
-                # sector：你原本寫 A-Share，維持一致
                 sector = "A-Share"
 
                 conn.execute(
@@ -177,14 +174,7 @@ def get_cn_stock_list():
                     (symbol, name, sector, market, market_detail, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (
-                        symbol,
-                        name,
-                        sector,
-                        market,
-                        market_detail,
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    ),
+                    (symbol, name, sector, market, market_detail, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                 )
                 stock_list.append((symbol, name))
 
@@ -198,7 +188,7 @@ def get_cn_stock_list():
     except Exception as e:
         log(f"⚠️ akshare 名單取得失敗（將 fallback）: {e}")
 
-    # 2) fallback：從 DB stock_info 既有清單跑（若你之前曾成功導入過）
+    # 2) fallback：改用 DB 既有 stock_info
     conn = sqlite3.connect(DB_PATH)
     try:
         rows = conn.execute("SELECT symbol, name FROM stock_info").fetchall()
@@ -247,7 +237,6 @@ def download_one_cn(symbol: str, actual_start: str, end_date: str):
             df = df.reset_index()
             df.columns = [c.lower() for c in df.columns]
 
-            # 日期欄位
             if "date" not in df.columns:
                 if "index" in df.columns:
                     df["date"] = df["index"]
@@ -305,7 +294,6 @@ def run_sync(start_date=None, end_date=None):
     try:
         pbar = tqdm(items, desc="CN同步", unit="檔")
         for symbol, name in pbar:
-            # 增量計算
             actual_start = start_date
             last_date = last_date_map.get(symbol)
             if last_date:
@@ -313,3 +301,59 @@ def run_sync(start_date=None, end_date=None):
                     next_day = (pd.to_datetime(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
                     actual_start = next_day
                     if pd.to_datetime(actual_start) > pd.to_datetime(end_date):
+                        skip_count += 1
+                        continue
+                except Exception:
+                    actual_start = start_date
+
+            df_res, err = download_one_cn(symbol, actual_start, end_date)
+
+            if df_res is not None and not df_res.empty:
+                df_res.to_sql(
+                    "stock_prices",
+                    conn,
+                    if_exists="append",
+                    index=False,
+                    method=lambda table, conn2, keys, data_iter: conn2.executemany(
+                        f"INSERT OR REPLACE INTO {table.name} ({', '.join(keys)}) VALUES ({', '.join(['?']*len(keys))})",
+                        data_iter,
+                    ),
+                )
+                success_count += 1
+            else:
+                fail_count += 1
+                if err:
+                    try:
+                        conn.execute(
+                            "INSERT INTO download_errors (symbol, name, start_date, end_date, error, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            (symbol, name, start_date, end_date, err, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                        )
+                    except Exception:
+                        pass
+
+            time.sleep(0.03)
+
+        conn.commit()
+
+        log("🧹 執行資料庫 VACUUM...")
+        conn.execute("VACUUM")
+        conn.commit()
+
+        db_info_cnt = conn.execute("SELECT COUNT(DISTINCT symbol) FROM stock_info").fetchone()[0]
+    finally:
+        conn.close()
+
+    mins = (time.time() - t0) / 60
+    log(f"📊 A 股同步完成 | 成功:{success_count} 跳過:{skip_count} 失敗:{fail_count} | {mins:.1f} 分鐘")
+
+    return {
+        "success": success_count,
+        "total": db_info_cnt,
+        "skipped": skip_count,
+        "failed": fail_count,
+        "has_changed": success_count > 0,
+    }
+
+
+if __name__ == "__main__":
+    run_sync(start_date="2024-01-01", end_date="2025-12-31")
