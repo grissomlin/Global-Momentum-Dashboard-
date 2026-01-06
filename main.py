@@ -37,12 +37,13 @@ except ImportError:
     print("⚠️ 系統提示：找不到 processor.py，將跳過特徵處理")
     process_market_data = None
 
-# 2.5) 導入事件表引擎（limitup_events / daytrade_events）
+# 2.5) 導入事件表引擎（limit_up_events / daytrade_events）
+# ✅ 修正：對齊 event_engine.py 的函數名稱 build_event_tables
 try:
-    from event_engine import build_events
+    from event_engine import build_event_tables
 except ImportError:
     print("⚠️ 系統提示：找不到 event_engine.py，將跳過事件表生成")
-    build_events = None
+    build_event_tables = None
 
 # ✅ 只針對這些市場跑事件表（其他市場跳過）
 EVENT_ENGINE_MARKETS = {"tw", "cn", "jp"}
@@ -152,6 +153,7 @@ def process_market(market_code: str, drive_service):
             print(f"   耗時: {dt:.1f}秒")
 
             # (D) 特徵處理
+            feature_ok = True
             if process_market_data:
                 try:
                     print("🔧 開始特徵處理...")
@@ -159,17 +161,21 @@ def process_market(market_code: str, drive_service):
                     process_market_data(db_file)
                     print(f"✅ 特徵處理完成，耗時: {time.time()-t1:.1f}秒")
                 except Exception as e:
+                    feature_ok = False
                     print(f"❌ 特徵處理失敗: {e}")
             else:
                 print("⚠️ 跳過特徵處理 (未載入 processor)")
+                feature_ok = False  # 沒有特徵層，事件表容易缺欄位，保守起見不跑
 
-            # (D2) 事件表生成：只針對 tw/cn/jp
+            # (D2) 事件表生成：只針對 tw/cn/jp，且特徵層成功才跑
             if market_code in EVENT_ENGINE_MARKETS:
-                if build_events:
+                if not feature_ok:
+                    print("⏭️ 跳過事件表生成（特徵層未成功產生 stock_analysis）")
+                elif build_event_tables:
                     try:
-                        print("🧩 開始生成事件表 (limitup_events / daytrade_events)...")
+                        print("🧩 開始生成事件表 (limit_up_events / daytrade_events)...")
                         t2 = time.time()
-                        build_events(db_file)
+                        build_event_tables(db_file)
                         print(f"✅ 事件表生成完成，耗時: {time.time()-t2:.1f}秒")
                     except Exception as e:
                         print(f"❌ 事件表生成失敗: {e}")
