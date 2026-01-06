@@ -30,15 +30,22 @@ socket.setdefaulttimeout(SOCKET_TIMEOUT)
 
 GDRIVE_FOLDER_ID = os.environ.get(ENV_GDRIVE_FOLDER_ID)
 
-# 2) 導入特徵加工模組（保留 processor）
+# 2) 導入 Kbar 聚合器（周/月/年K）
+try:
+    from kbar_aggregator import build_kbars
+except ImportError:
+    print("⚠️ 系統提示：找不到 kbar_aggregator.py，將跳過周/月/年K聚合")
+    build_kbars = None
+
+# 3) 導入特徵加工模組（processor）
 try:
     from processor import process_market_data
 except ImportError:
     print("⚠️ 系統提示：找不到 processor.py，將跳過特徵處理")
     process_market_data = None
 
-# 2.5) 導入事件表引擎（limit_up_events / daytrade_events）
-# ✅ 修正：對齊 event_engine.py 的函數名稱 build_event_tables
+# 4) 導入事件表引擎（limit_up_events / daytrade_events）
+# ✅ 對齊 event_engine.py 的函數名稱 build_event_tables
 try:
     from event_engine import build_event_tables
 except ImportError:
@@ -65,7 +72,7 @@ def load_downloader(module_name: str):
         return None
 
 
-# 3) 載入各市場下載器
+# 5) 載入各市場下載器
 module_map = {
     "tw": load_downloader("downloader_tw"),
     "us": load_downloader("downloader_us"),
@@ -138,6 +145,7 @@ def process_market(market_code: str, drive_service):
         print(f"📡 同步區間: {actual_start} ~ {FORCE_END_DATE}")
 
         try:
+            # 1) 下載
             t0 = time.time()
             result = downloader.run_sync(start_date=actual_start, end_date=FORCE_END_DATE)
             dt = time.time() - t0
@@ -152,11 +160,26 @@ def process_market(market_code: str, drive_service):
             print(f"   成功: {result.get('success', 0)}/{result.get('total', 0)}")
             print(f"   耗時: {dt:.1f}秒")
 
-            # (D) 特徵處理
+            # 2) 周/月/年K 聚合（先做，後面事件表/貢獻度會用到）
+            kbar_ok = True
+            if build_kbars:
+                try:
+                    print("🧱 開始建立周/月/年K (kbar_weekly/monthly/yearly)...")
+                    t_k = time.time()
+                    build_kbars(db_file)
+                    print(f"✅ Kbar 聚合完成，耗時: {time.time()-t_k:.1f}秒")
+                except Exception as e:
+                    kbar_ok = False
+                    print(f"❌ Kbar 聚合失敗: {e}")
+            else:
+                print("⚠️ 跳過 Kbar 聚合 (未載入 kbar_aggregator)")
+                kbar_ok = False  # 保守：沒年K peak_date，後面貢獻度可能做不起來
+
+            # 3) 特徵處理（stock_analysis）
             feature_ok = True
             if process_market_data:
                 try:
-                    print("🔧 開始特徵處理...")
+                    print("🔧 開始特徵處理 (stock_analysis)...")
                     t1 = time.time()
                     process_market_data(db_file)
                     print(f"✅ 特徵處理完成，耗時: {time.time()-t1:.1f}秒")
@@ -165,9 +188,9 @@ def process_market(market_code: str, drive_service):
                     print(f"❌ 特徵處理失敗: {e}")
             else:
                 print("⚠️ 跳過特徵處理 (未載入 processor)")
-                feature_ok = False  # 沒有特徵層，事件表容易缺欄位，保守起見不跑
+                feature_ok = False
 
-            # (D2) 事件表生成：只針對 tw/cn/jp，且特徵層成功才跑
+            # 4) 事件表生成（只針對 tw/cn/jp，而且特徵層成功才跑）
             if market_code in EVENT_ENGINE_MARKETS:
                 if not feature_ok:
                     print("⏭️ 跳過事件表生成（特徵層未成功產生 stock_analysis）")
@@ -175,6 +198,8 @@ def process_market(market_code: str, drive_service):
                     try:
                         print("🧩 開始生成事件表 (limit_up_events / daytrade_events)...")
                         t2 = time.time()
+                        # 事件表內部若要用年K peak_date，你已經有 kbar_yearly
+                        # kbar_ok=False 也可以照跑（只是少某些分析欄位），看你 event_engine 怎麼寫
                         build_event_tables(db_file)
                         print(f"✅ 事件表生成完成，耗時: {time.time()-t2:.1f}秒")
                     except Exception as e:
@@ -184,7 +209,7 @@ def process_market(market_code: str, drive_service):
             else:
                 print(f"⏭️ 跳過事件表生成（{market_code.upper()} 不在事件表目標市場 {sorted(EVENT_ENGINE_MARKETS)}）")
 
-            # (E) 雲端上傳（穩定性上傳）
+            # 5) 雲端上傳（穩定性上傳）
             if drive_service and GDRIVE_FOLDER_ID:
                 print("☁️ 開始雲端同步...")
                 optimize_database(db_file)
