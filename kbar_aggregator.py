@@ -1,406 +1,424 @@
+# kbar_aggregator.py
 # -*- coding: utf-8 -*-
 """
 kbar_aggregator.py
 ------------------
-將日K(stock_prices) 聚合成
+從 SQLite(stock_prices) 日K → 清洗 → 聚合產生 週K / 月K / 年K（寫回同一個 DB）
 
-✅ kbar_weekly   (週K)
-✅ kbar_monthly  (月K)
-✅ kbar_yearly   (年K, 含 peak_date / peak_high / peak_high_ret)
+✅ 目標（支援你的儀表板/研究）：
+- 產出 kbar_weekly / kbar_monthly / kbar_yearly 三張表
+- 週/月/年K「同源一致」：全部由日K聚合（避免 yfinance 1wk 定義不一致）
+- 內建「異常報酬清洗」：參考你貼的 pingpong 概念 + limit sanity check
+- 額外提供 year_peak_date / year_peak_high：讓你能快速算
+  「年K高點前有幾根漲停」、「週/月對年K高點貢獻度」等
 
-設計目標：
-- 與你的 DB schema 相容：stock_prices(symbol,date,open,high,low,close,volume)
-- 能用於後續「對齊年K最高點」的貢獻度研究（peak_date 是關鍵）
-- 可直接在 main.py / pipeline 呼叫：build_kbars(db_path)
+📌 依賴：
+- pandas, numpy（都在你的環境中）
+- SQLite 表：
+  - stock_prices(symbol,date,open,high,low,close,volume)
+  - stock_info(symbol,market,market_detail,sector,name...)  (可選，但建議有)
 
-注意：
-- 這裡使用「自然週」W-MON（週一開始，週日結束）你可以改成 W-FRI 等
-- 月K：每月自然月
-- 年K：每年自然年
+⚠️ 注意：
+- 這支腳本不依賴 yfinance，不會額外抓資料
+- 若你 downloader 已使用 auto_adjust=True，close 已接近還原價，這裡的清洗會更可靠
+
+用法：
+    python kbar_aggregator.py tw_stock_warehouse.db
+或在程式裡呼叫：
+    from kbar_aggregator import build_kbars
+    build_kbars("tw_stock_warehouse.db")
+
 """
 
+import sys
 import sqlite3
-from datetime import datetime
+import warnings
+from dataclasses import dataclass
+from typing import Optional, Dict, Tuple
+
+import numpy as np
 import pandas as pd
 
-
-# ======================
-# 工具
-# ======================
-def log(msg: str):
-    print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}", flush=True)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-def _ensure_tables(conn: sqlite3.Connection):
-    """建立 kbar_* 表（若不存在），並建立索引"""
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS kbar_weekly (
-            symbol TEXT,
-            week_start TEXT,
-            week_end TEXT,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL,
-            volume INTEGER,
-            prev_close REAL,
-            ret_pct REAL,
-            logret REAL,
-            PRIMARY KEY (symbol, week_start)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS kbar_monthly (
-            symbol TEXT,
-            month TEXT,           -- YYYY-MM
-            period_start TEXT,
-            period_end TEXT,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL,
-            volume INTEGER,
-            prev_close REAL,
-            ret_pct REAL,
-            logret REAL,
-            PRIMARY KEY (symbol, month)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS kbar_yearly (
-            symbol TEXT,
-            year INTEGER,
-            period_start TEXT,
-            period_end TEXT,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL,
-            volume INTEGER,
-
-            peak_date TEXT,       -- 年內最高價當日日期
-            peak_high REAL,       -- 年內最高價
-            peak_high_ret REAL,   -- (peak_high / year_open - 1) * 100
-
-            prev_close REAL,
-            ret_pct REAL,
-            logret REAL,
-
-            PRIMARY KEY (symbol, year)
-        )
-        """
-    )
-
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_w_symbol ON kbar_weekly(symbol)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_m_symbol ON kbar_monthly(symbol)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_y_symbol ON kbar_yearly(symbol)")
+# =============================================================================
+# 可選：接 market_rules（若存在就用它的 limit/tick 規則做更精準清洗）
+# =============================================================================
+try:
+    import market_rules  # 你的規則檔（若已完成）
+    HAS_MARKET_RULES = True
+except Exception:
+    market_rules = None
+    HAS_MARKET_RULES = False
 
 
-def _read_stock_prices(conn: sqlite3.Connection) -> pd.DataFrame:
-    """讀取 stock_prices + 基本清洗"""
-    df = pd.read_sql(
-        """
-        SELECT symbol, date, open, high, low, close, volume
-        FROM stock_prices
-        """,
-        conn,
-    )
+# =============================================================================
+# 設定
+# =============================================================================
+PINGPONG_THRESHOLD = 0.40     # 你貼的：連續兩日 abs(ret)>0.4 且反向 → 異常
+LIMIT_SANITY_MULT = 1.50      # 有漲跌幅限制市場：abs(ret) > limit*1.5 視為異常
+MIN_DAYS_PER_SYMBOL = 40      # 太短的不做
+SQLITE_TIMEOUT = 120
+
+
+@dataclass
+class LimitRule:
+    kind: str                 # 'pct' / 'none'
+    up_pct: Optional[float]   # 0.10 / 0.20 / None
+
+
+def _fallback_limit_rule(market: confirm str, market_detail: str, symbol: str) -> LimitRule:
+    """
+    若 market_rules 不存在時的保底判斷：
+    - TW: listed/otc 10%, emerging none
+    - CN: 300/301/688 20% else 10%
+    - JP: none (你之後用 market_rules 補精準値幅)
+    """
+    m = (market or "").upper().strip()
+    md = (market_detail or "").lower().strip()
+    sym = (symbol or "").upper().strip()
+
+    # TW
+    if m in ["TW", "TSE", "GTSM"] or sym.endswith(".TW") or sym.endswith(".TWO"):
+        if md == "emerging":
+            return LimitRule(kind="none", up_pct=None)
+        return LimitRule(kind="pct", up_pct=0.10)
+
+    # CN
+    if m in ["SSE", "SZSE", "CN", "CHINA"] or sym.endswith(".SS") or sym.endswith(".SZ"):
+        code = "".join([c for c in sym if c.isdigit()])
+        if code.startswith(("300", "301", "688")):
+            return LimitRule(kind="pct", up_pct=0.20)
+        return LimitRule(kind="pct", up_pct=0.10)
+
+    # JP
+    if m in ["JP", "JPX", "TSE"] or sym.endswith(".T"):
+        return LimitRule(kind="none", up_pct=None)
+
+    return LimitRule(kind="none", up_pct=None)
+
+
+def _get_limit_rule(market: str, market_detail: str, symbol: str) -> LimitRule:
+    """
+    盡量用 market_rules.get_rule()，否則 fallback。
+    只拿「是否 pct limit」與「上限」用於 sanity check。
+    """
+    if HAS_MARKET_RULES and hasattr(market_rules, "get_rule"):
+        try:
+            r = market_rules.get_rule(market=market, market_detail=market_detail, symbol=symbol)
+            kind = r.get("limit_kind", "none")
+            up = r.get("limit_up_pct", None)
+            if kind == "pct" and isinstance(up, (int, float)):
+                return LimitRule(kind="pct", up_pct=float(up))
+            return LimitRule(kind="none", up_pct=None)
+        except Exception:
+            pass
+    return _fallback_limit_rule(market, market_detail, symbol)
+
+
+# =============================================================================
+# 清洗：pingpong + limit sanity + 基礎修補
+# =============================================================================
+def _clean_daily(df: pd.DataFrame, limit_rule: LimitRule) -> pd.DataFrame:
+    """
+    df: 單一 symbol 的日K，需包含 date/open/high/low/close/volume
+    回傳清洗後 df（仍保持日頻），並新增 clean_ret
+    """
+
     if df.empty:
         return df
 
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values(["symbol", "date"])
-    # 基本防呆：缺欄位補 0
-    if "volume" in df.columns:
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype("int64")
+    df = df.sort_values("date").reset_index(drop=True).copy()
+
+    # 基礎：價量無效
     for c in ["open", "high", "low", "close"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        df.loc[df[c].astype(float) <= 0, c] = np.nan
+
+    # 修補 close（因為 ret 依賴 close）
+    df["close"] = df["close"].astype(float).ffill()
+
+    # 用 close 算報酬
+    df["clean_ret"] = df["close"].pct_change().astype(float)
+
+    # (1) limit sanity check（有漲跌幅限制市場）
+    if limit_rule.kind == "pct" and limit_rule.up_pct is not None:
+        max_abs = float(limit_rule.up_pct) * LIMIT_SANITY_MULT
+        bad = df["clean_ret"].abs() > max_abs
+        # 這些日子視為異常：把 OHLC 全設 NaN，再用 close ffill 讓聚合不炸
+        if bad.any():
+            for c in ["open", "high", "low", "close"]:
+                df.loc[bad, c] = np.nan
+            df["close"] = df["close"].ffill()
+            df["clean_ret"] = df["close"].pct_change().astype(float)
+
+    # (2) pingpong filter（你貼的精神）
+    # 若 i 與 i+1 連續兩日 abs(ret)>threshold 且 ret 方向相反 → i, i+1 標記異常
+    r = df["clean_ret"].values
+    mask = np.zeros(len(df), dtype=bool)
+    for i in range(1, len(df) - 1):
+        prev = r[i]
+        nxt = r[i + 1]
+        if np.isfinite(prev) and np.isfinite(nxt):
+            if (abs(prev) > PINGPONG_THRESHOLD) and (abs(nxt) > PINGPONG_THRESHOLD) and (prev * nxt < 0):
+                mask[i] = True
+                mask[i + 1] = True
+
+    if mask.any():
+        for c in ["open", "high", "low", "close"]:
+            df.loc[mask, c] = np.nan
+        df["close"] = df["close"].ffill()
+        df["clean_ret"] = df["close"].pct_change().astype(float)
+
+    # 重新補 open/high/low（保守：用 close 近似補洞，確保聚合不中斷）
+    # 你若更想嚴格，可以改成：只 ffill close，不補 open/high/low，但聚合可能缺資料
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+
+    df["open"] = df["open"].fillna(df["close"])
+    df["high"] = df["high"].fillna(df[["open", "close"]].max(axis=1))
+    df["low"] = df["low"].fillna(df[["open", "close"]].min(axis=1))
+
+    # volume
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype(float)
+    else:
+        df["volume"] = 0.0
+
     return df
 
 
-def _calc_prev_ret_log(df: pd.DataFrame, key_cols):
-    """
-    給定 df（已經是週/月/年聚合結果），依 key_cols（symbol + period key）排序後
-    加上 prev_close / ret_pct / logret
-    """
-    df = df.sort_values(["symbol"] + key_cols)
+# =============================================================================
+# 聚合：由日K生成 週/月/年
+# =============================================================================
+def _agg_ohlcv(g: pd.DataFrame) -> pd.Series:
+    """對單一 period 的 OHLCV 聚合"""
+    if g.empty:
+        return pd.Series({"open": np.nan, "high": np.nan, "low": np.nan, "close": np.nan, "volume": 0.0})
 
-    df["prev_close"] = df.groupby("symbol")["close"].shift(1)
-
-    df["ret_pct"] = None
-    mask = df["prev_close"].notna() & (df["prev_close"] > 0) & df["close"].notna()
-    df.loc[mask, "ret_pct"] = (df.loc[mask, "close"] / df.loc[mask, "prev_close"] - 1.0) * 100.0
-
-    df["logret"] = None
-    mask2 = df["prev_close"].notna() & (df["prev_close"] > 0) & df["close"].notna() & (df["close"] > 0)
-    df.loc[mask2, "logret"] = (df.loc[mask2, "close"] / df.loc[mask2, "prev_close"]).map(
-        lambda x: None if pd.isna(x) else float(pd.np.log(x))  # type: ignore
-    )
-    return df
-
-
-# ======================
-# 聚合：週K
-# ======================
-def _build_weekly(df_daily: pd.DataFrame) -> pd.DataFrame:
-    """
-    週K：W-MON（週一為週期起點）
-    週區間：week_start / week_end
-    """
-    if df_daily.empty:
-        return df_daily
-
-    d = df_daily.copy()
-    # week_start：週一
-    d["week_start"] = d["date"].dt.to_period("W-MON").apply(lambda p: p.start_time)
-    d["week_end"] = d["week_start"] + pd.Timedelta(days=6)
-
-    g = d.groupby(["symbol", "week_start"], as_index=False)
-
-    out = g.agg(
-        week_end=("week_end", "max"),
-        open=("open", "first"),
-        high=("high", "max"),
-        low=("low", "min"),
-        close=("close", "last"),
-        volume=("volume", "sum"),
+    return pd.Series(
+        {
+            "open": float(g["open"].iloc[0]),
+            "high": float(np.nanmax(g["high"].values)),
+            "low": float(np.nanmin(g["low"].values)),
+            "close": float(g["close"].iloc[-1]),
+            "volume": float(np.nansum(g["volume"].values)),
+        }
     )
 
-    # 字串化
-    out["week_start"] = pd.to_datetime(out["week_start"]).dt.strftime("%Y-%m-%d")
-    out["week_end"] = pd.to_datetime(out["week_end"]).dt.strftime("%Y-%m-%d")
 
-    # prev_close / ret / logret（依 week_start 排）
-    out = out.sort_values(["symbol", "week_start"])
-    out["prev_close"] = out.groupby("symbol")["close"].shift(1)
-
-    mask = out["prev_close"].notna() & (out["prev_close"] > 0) & out["close"].notna()
-    out["ret_pct"] = None
-    out.loc[mask, "ret_pct"] = (out.loc[mask, "close"] / out.loc[mask, "prev_close"] - 1.0) * 100.0
-
-    out["logret"] = None
-    mask2 = out["prev_close"].notna() & (out["prev_close"] > 0) & out["close"].notna() & (out["close"] > 0)
-    out.loc[mask2, "logret"] = (out.loc[mask2, "close"] / out.loc[mask2, "prev_close"]).map(
-        lambda x: None if pd.isna(x) else float(pd.np.log(x))  # type: ignore
-    )
-
-    return out
-
-
-# ======================
-# 聚合：月K
-# ======================
-def _build_monthly(df_daily: pd.DataFrame) -> pd.DataFrame:
-    if df_daily.empty:
-        return df_daily
-
-    d = df_daily.copy()
-    d["month"] = d["date"].dt.to_period("M").astype(str)  # YYYY-MM
-    d["period_start"] = d["date"].dt.to_period("M").apply(lambda p: p.start_time)
-    d["period_end"] = d["date"].dt.to_period("M").apply(lambda p: p.end_time)
-
-    g = d.groupby(["symbol", "month"], as_index=False)
-
-    out = g.agg(
-        period_start=("period_start", "min"),
-        period_end=("period_end", "max"),
-        open=("open", "first"),
-        high=("high", "max"),
-        low=("low", "min"),
-        close=("close", "last"),
-        volume=("volume", "sum"),
-    )
-
-    out["period_start"] = pd.to_datetime(out["period_start"]).dt.strftime("%Y-%m-%d")
-    out["period_end"] = pd.to_datetime(out["period_end"]).dt.strftime("%Y-%m-%d")
-
-    out = out.sort_values(["symbol", "month"])
-    out["prev_close"] = out.groupby("symbol")["close"].shift(1)
-
-    mask = out["prev_close"].notna() & (out["prev_close"] > 0) & out["close"].notna()
-    out["ret_pct"] = None
-    out.loc[mask, "ret_pct"] = (out.loc[mask, "close"] / out.loc[mask, "prev_close"] - 1.0) * 100.0
-
-    out["logret"] = None
-    mask2 = out["prev_close"].notna() & (out["prev_close"] > 0) & out["close"].notna() & (out["close"] > 0)
-    out.loc[mask2, "logret"] = (out.loc[mask2, "close"] / out.loc[mask2, "prev_close"]).map(
-        lambda x: None if pd.isna(x) else float(pd.np.log(x))  # type: ignore
-    )
-
-    return out
-
-
-# ======================
-# 聚合：年K（含 peak_date）
-# ======================
-def _build_yearly(df_daily: pd.DataFrame) -> pd.DataFrame:
-    if df_daily.empty:
-        return df_daily
-
-    d = df_daily.copy()
-    d["year"] = d["date"].dt.year
-    d["period_start"] = d["date"].dt.to_period("Y").apply(lambda p: p.start_time)
-    d["period_end"] = d["date"].dt.to_period("Y").apply(lambda p: p.end_time)
-
-    # 先做年K OHLCV
-    g = d.groupby(["symbol", "year"], as_index=False)
-    y = g.agg(
-        period_start=("period_start", "min"),
-        period_end=("period_end", "max"),
-        open=("open", "first"),
-        high=("high", "max"),
-        low=("low", "min"),
-        close=("close", "last"),
-        volume=("volume", "sum"),
-    )
-
-    y["period_start"] = pd.to_datetime(y["period_start"]).dt.strftime("%Y-%m-%d")
-    y["period_end"] = pd.to_datetime(y["period_end"]).dt.strftime("%Y-%m-%d")
-
-    # peak_date / peak_high：由日K找年內最高 high 的那一天
-    # 做法：先找每個 (symbol, year) 的 max_high，再回貼第一個命中的日期
-    d_valid = d.dropna(subset=["high"]).copy()
-    max_high = (
-        d_valid.groupby(["symbol", "year"], as_index=False)["high"]
-        .max()
-        .rename(columns={"high": "peak_high"})
-    )
-
-    d2 = d_valid.merge(max_high, on=["symbol", "year"], how="left")
-    d2 = d2[d2["high"] == d2["peak_high"]].sort_values(["symbol", "year", "date"])
-    peak = d2.groupby(["symbol", "year"], as_index=False).first()[["symbol", "year", "date", "peak_high"]]
-    peak = peak.rename(columns={"date": "peak_date"})
-    peak["peak_date"] = pd.to_datetime(peak["peak_date"]).dt.strftime("%Y-%m-%d")
-
-    y = y.merge(peak, on=["symbol", "year"], how="left")
-
-    # peak_high_ret = (peak_high / year_open - 1) * 100
-    y["peak_high_ret"] = None
-    maskp = y["open"].notna() & (y["open"] > 0) & y["peak_high"].notna()
-    y.loc[maskp, "peak_high_ret"] = (y.loc[maskp, "peak_high"] / y.loc[maskp, "open"] - 1.0) * 100.0
-
-    # prev_close / ret / logret（依 year 排）
-    y = y.sort_values(["symbol", "year"])
-    y["prev_close"] = y.groupby("symbol")["close"].shift(1)
-
-    mask = y["prev_close"].notna() & (y["prev_close"] > 0) & y["close"].notna()
-    y["ret_pct"] = None
-    y.loc[mask, "ret_pct"] = (y.loc[mask, "close"] / y.loc[mask, "prev_close"] - 1.0) * 100.0
-
-    y["logret"] = None
-    mask2 = y["prev_close"].notna() & (y["prev_close"] > 0) & y["close"].notna() & (y["close"] > 0)
-    y.loc[mask2, "logret"] = (y.loc[mask2, "close"] / y.loc[mask2, "prev_close"]).map(
-        lambda x: None if pd.isna(x) else float(pd.np.log(x))  # type: ignore
-    )
-
-    return y
-
-
-# ======================
-# 寫入 DB（replace or upsert）
-# ======================
-def _write_table(conn: sqlite3.Connection, df: pd.DataFrame, table_name: str, pk_cols: list):
+def _build_weekly(df: pd.DataFrame) -> pd.DataFrame:
     """
-    以 INSERT OR REPLACE 寫入，避免重複
+    週K：以 ISO week 做週期鍵（跨年週會歸到 ISO year）
+    period_end：週最後一個交易日（實際存在的日K最後一天）
     """
-    if df.empty:
-        return
+    x = df.copy()
+    iso = x["date"].dt.isocalendar()
+    x["iso_year"] = iso["year"].astype(int)
+    x["iso_week"] = iso["week"].astype(int)
+    x["period_key"] = x["iso_year"].astype(str) + "-W" + x["iso_week"].astype(str).str.zfill(2)
 
-    cols = list(df.columns)
-    placeholders = ", ".join(["?"] * len(cols))
-    col_list = ", ".join(cols)
+    out = (
+        x.groupby("period_key", sort=True)
+        .apply(_agg_ohlcv)
+        .reset_index()
+        .rename(columns={"period_key": "week_id"})
+    )
 
-    sql = f"INSERT OR REPLACE INTO {table_name} ({col_list}) VALUES ({placeholders})"
-    data = df[cols].where(pd.notna(df[cols]), None).values.tolist()
-    conn.executemany(sql, data)
+    # start/end date
+    se = x.groupby("period_key")["date"].agg(["min", "max"]).reset_index()
+    se.columns = ["week_id", "period_start", "period_end"]
+    out = out.merge(se, on="week_id", how="left")
+
+    # year/week
+    out["year"] = out["week_id"].str.slice(0, 4).astype(int)
+    out["week"] = out["week_id"].str.split("-W").str[1].astype(int)
+
+    return out[["week_id", "year", "week", "period_start", "period_end", "open", "high", "low", "close", "volume"]]
 
 
-# ======================
-# 對外 API
-# ======================
-def build_kbars(db_path: str, rebuild: bool = True) -> dict:
-    """
-    入口：從 stock_prices 建立 kbar_weekly/monthly/yearly
+def _build_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    x = df.copy()
+    x["year"] = x["date"].dt.year.astype(int)
+    x["month"] = x["date"].dt.month.astype(int)
+    x["month_id"] = x["year"].astype(str) + "-" + x["month"].astype(str).str.zfill(2)
 
-    rebuild=True：會先 DROP 舊表再重建（最乾淨）
-    rebuild=False：保留表結構，只做 INSERT OR REPLACE 更新（較快）
-    """
-    t0 = time.time() if "time" in globals() else None  # 防呆
+    out = x.groupby("month_id", sort=True).apply(_agg_ohlcv).reset_index()
+    se = x.groupby("month_id")["date"].agg(["min", "max"]).reset_index()
+    se.columns = ["month_id", "period_start", "period_end"]
+    out = out.merge(se, on="month_id", how="left")
 
-    log(f"🧱 開始建立 KBar 聚合表: {db_path}")
+    out["year"] = out["month_id"].str.slice(0, 4).astype(int)
+    out["month"] = out["month_id"].str.slice(5, 7).astype(int)
 
-    conn = sqlite3.connect(db_path)
+    return out[["month_id", "year", "month", "period_start", "period_end", "open", "high", "low", "close", "volume"]]
+
+
+def _build_yearly(df: pd.DataFrame) -> pd.DataFrame:
+    x = df.copy()
+    x["year"] = x["date"].dt.year.astype(int)
+    x["year_id"] = x["year"].astype(str)
+
+    out = x.groupby("year_id", sort=True).apply(_agg_ohlcv).reset_index()
+    se = x.groupby("year_id")["date"].agg(["min", "max"]).reset_index()
+    se.columns = ["year_id", "period_start", "period_end"]
+    out = out.merge(se, on="year_id", how="left")
+
+    out["year"] = out["year_id"].astype(int)
+
+    # 年內高點（用 high）
+    peak = x.groupby("year_id").apply(lambda g: pd.Series({
+        "year_peak_date": g.loc[g["high"].astype(float).idxmax(), "date"] if len(g) else pd.NaT,
+        "year_peak_high": float(np.nanmax(g["high"].astype(float).values)) if len(g) else np.nan
+    })).reset_index().rename(columns={"year_id": "year_id"})
+
+    out = out.merge(peak, left_on="year_id", right_on="year_id", how="left")
+    return out[["year_id", "year", "period_start", "period_end", "open", "high", "low", "close", "volume", "year_peak_date", "year_peak_high"]]
+
+
+# =============================================================================
+# DB IO
+# =============================================================================
+def _ensure_indexes(conn: sqlite3.Connection):
+    # 日K索引（如果沒有）
     try:
-        if rebuild:
-            conn.execute("DROP TABLE IF EXISTS kbar_weekly")
-            conn.execute("DROP TABLE IF EXISTS kbar_monthly")
-            conn.execute("DROP TABLE IF EXISTS kbar_yearly")
-            conn.commit()
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_symbol_date ON stock_prices(symbol, date)")
+    except Exception:
+        pass
 
-        _ensure_tables(conn)
 
-        df_daily = _read_stock_prices(conn)
-        if df_daily.empty:
-            log("⚠️ stock_prices 沒資料，跳過 kbar 聚合")
-            return {"ok": False, "weekly": 0, "monthly": 0, "yearly": 0}
+def _write_table(conn: sqlite3.Connection, name: str, df: pd.DataFrame):
+    conn.execute(f"DROP TABLE IF EXISTS {name}")
+    df.to_sql(name, conn, if_exists="replace", index=False)
 
-        log(f"📥 讀取日K完成: {len(df_daily):,} 筆 | symbols={df_daily['symbol'].nunique():,}")
+    # 常用索引
+    try:
+        if name == "kbar_weekly":
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_weekly_symbol_end ON kbar_weekly(symbol, period_end)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_weekly_symbol_week ON kbar_weekly(symbol, week_id)")
+        elif name == "kbar_monthly":
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_monthly_symbol_end ON kbar_monthly(symbol, period_end)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_monthly_symbol_month ON kbar_monthly(symbol, month_id)")
+        elif name == "kbar_yearly":
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_yearly_symbol_year ON kbar_yearly(symbol, year)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_yearly_symbol_end ON kbar_yearly(symbol, period_end)")
+    except Exception:
+        pass
 
-        # Build
-        log("🧩 生成週K...")
-        w = _build_weekly(df_daily)
-        log(f"✅ 週K完成: {len(w):,}")
 
-        log("🧩 生成月K...")
-        m = _build_monthly(df_daily)
-        log(f"✅ 月K完成: {len(m):,}")
+# =============================================================================
+# 主函數
+# =============================================================================
+def build_kbars(db_path: str, symbols: Optional[list] = None) -> Dict[str, int]:
+    """
+    讀 stock_prices → 清洗 → 聚合 → 寫回 kbar_weekly/monthly/yearly
+    回傳統計 dict
+    """
 
-        log("🧩 生成年K（含 peak_date）...")
-        y = _build_yearly(df_daily)
-        log(f"✅ 年K完成: {len(y):,}")
+    conn = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT)
+    try:
+        _ensure_indexes(conn)
 
-        # Write
-        log("💾 寫入資料庫...")
-        _write_table(conn, w, "kbar_weekly", ["symbol", "week_start"])
-        _write_table(conn, m, "kbar_monthly", ["symbol", "month"])
-        _write_table(conn, y, "kbar_yearly", ["symbol", "year"])
+        # 讀 stock_prices + stock_info（market判定用）
+        query = """
+        SELECT p.symbol, p.date, p.open, p.high, p.low, p.close, p.volume,
+               i.market, i.market_detail
+        FROM stock_prices p
+        LEFT JOIN stock_info i ON p.symbol = i.symbol
+        """
+        df = pd.read_sql(query, conn)
+
+        if df.empty:
+            print("❌ stock_prices 無資料")
+            return {"symbols": 0, "weekly_rows": 0, "monthly_rows": 0, "yearly_rows": 0}
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values(["symbol", "date"]).reset_index(drop=True)
+
+        if symbols:
+            sset = set(symbols)
+            df = df[df["symbol"].isin(sset)].copy()
+            if df.empty:
+                print("❌ 指定 symbols 在 DB 找不到資料")
+                return {"symbols": 0, "weekly_rows": 0, "monthly_rows": 0, "yearly_rows": 0}
+
+        wk_list, mo_list, yr_list = [], [], []
+        symbol_count = 0
+
+        for sym, g in df.groupby("symbol", sort=False):
+            g = g.sort_values("date").reset_index(drop=True)
+            if len(g) < MIN_DAYS_PER_SYMBOL:
+                continue
+
+            market = g["market"].iloc[0] if "market" in g.columns else ""
+            market_detail = g["market_detail"].iloc[0] if "market_detail" in g.columns else ""
+
+            rule = _get_limit_rule(market, market_detail, sym)
+
+            gd = _clean_daily(g, rule)
+            if gd.empty or gd["close"].isna().all():
+                continue
+
+            # 聚合
+            w = _build_weekly(gd)
+            w.insert(0, "symbol", sym)
+            m = _build_monthly(gd)
+            m.insert(0, "symbol", sym)
+            y = _build_yearly(gd)
+            y.insert(0, "symbol", sym)
+
+            wk_list.append(w)
+            mo_list.append(m)
+            yr_list.append(y)
+
+            symbol_count += 1
+
+        if symbol_count == 0:
+            print("❌ 沒有足夠資料可聚合（可能都不足 MIN_DAYS_PER_SYMBOL）")
+            return {"symbols": 0, "weekly_rows": 0, "monthly_rows": 0, "yearly_rows": 0}
+
+        df_wk = pd.concat(wk_list, ignore_index=True)
+        df_mo = pd.concat(mo_list, ignore_index=True)
+        df_yr = pd.concat(yr_list, ignore_index=True)
+
+        # 日期欄位轉字串（SQLite穩）
+        for col in ["period_start", "period_end"]:
+            df_wk[col] = pd.to_datetime(df_wk[col]).dt.strftime("%Y-%m-%d")
+            df_mo[col] = pd.to_datetime(df_mo[col]).dt.strftime("%Y-%m-%d")
+            df_yr[col] = pd.to_datetime(df_yr[col]).dt.strftime("%Y-%m-%d")
+
+        df_yr["year_peak_date"] = pd.to_datetime(df_yr["year_peak_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+        # 寫回
+        _write_table(conn, "kbar_weekly", df_wk)
+        _write_table(conn, "kbar_monthly", df_mo)
+        _write_table(conn, "kbar_yearly", df_yr)
+
         conn.commit()
 
-        # 索引與統計
-        weekly_cnt = conn.execute("SELECT COUNT(*) FROM kbar_weekly").fetchone()[0]
-        monthly_cnt = conn.execute("SELECT COUNT(*) FROM kbar_monthly").fetchone()[0]
-        yearly_cnt = conn.execute("SELECT COUNT(*) FROM kbar_yearly").fetchone()[0]
+        print("\n✅ kbar 聚合完成（由日K聚合，已清洗）")
+        print(f"📌 symbols: {symbol_count}")
+        print(f"📌 kbar_weekly rows:  {len(df_wk):,}")
+        print(f"📌 kbar_monthly rows: {len(df_mo):,}")
+        print(f"📌 kbar_yearly rows:  {len(df_yr):,}")
 
-        log(f"📊 KBar 聚合完成 | weekly={weekly_cnt:,} monthly={monthly_cnt:,} yearly={yearly_cnt:,}")
-
-        return {"ok": True, "weekly": weekly_cnt, "monthly": monthly_cnt, "yearly": yearly_cnt}
+        return {
+            "symbols": int(symbol_count),
+            "weekly_rows": int(len(df_wk)),
+            "monthly_rows": int(len(df_mo)),
+            "yearly_rows": int(len(df_yr)),
+        }
 
     finally:
         conn.close()
 
 
-# ======================
-# CLI
-# ======================
 if __name__ == "__main__":
-    import sys
-    import time as _time
-
     if len(sys.argv) < 2:
-        print("用法: python kbar_aggregator.py <db_path> [--no-rebuild]")
-        raise SystemExit(1)
+        print("Usage: python kbar_aggregator.py <db_path> [symbol1 symbol2 ...]")
+        sys.exit(1)
 
-    db_path = sys.argv[1]
-    rebuild = True
-    if len(sys.argv) >= 3 and sys.argv[2] == "--no-rebuild":
-        rebuild = False
-
-    t0 = _time.time()
-    res = build_kbars(db_path, rebuild=rebuild)
-    print(res)
-    print(f"耗時: {_time.time()-t0:.1f} 秒")
+    db = sys.argv[1]
+    syms = sys.argv[2:] if len(sys.argv) > 2 else None
+    build_kbars(db, symbols=syms)
