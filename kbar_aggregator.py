@@ -3,412 +3,365 @@
 """
 kbar_aggregator.py
 ------------------
-從 SQLite(stock_prices) 日K → 清洗 → 聚合產生 週K / 月K / 年K（寫回同一個 DB）
+從日K（stock_analysis 或 stock_prices）聚合週K/月K/年K：
 
-✅ 目標（支援你的儀表板/研究）：
-- 產出 kbar_weekly / kbar_monthly / kbar_yearly 三張表
-- 週/月/年K「同源一致」：全部由日K聚合（避免 yfinance 1wk 定義不一致）
-- 內建「異常報酬清洗」：參考你貼的 pingpong 概念 + limit sanity check
-- 額外提供 year_peak_date / year_peak_high：讓你能快速算
-  「年K高點前有幾根漲停」、「週/月對年K高點貢獻度」等
+輸出表：
+- kbar_weekly : symbol, year, week_id, period_start, period_end, open, high, low, close, volume
+- kbar_monthly: symbol, year, month_id, period_start, period_end, open, high, low, close, volume
+- kbar_yearly : symbol, year, period_start, period_end, open, high, low, close, volume,
+                year_peak_date, year_peak_high
 
-📌 依賴：
-- pandas, numpy（都在你的環境中）
-- SQLite 表：
-  - stock_prices(symbol,date,open,high,low,close,volume)
-  - stock_info(symbol,market,market_detail,sector,name...)  (可選，但建議有)
-
-⚠️ 注意：
-- 這支腳本不依賴 yfinance，不會額外抓資料
-- 若你 downloader 已使用 auto_adjust=True，close 已接近還原價，這裡的清洗會更可靠
+✅ 特點（加法，不會破壞你現有功能）
+- 使用「clean_close」做聚合：保留原 close，不改 stock_analysis
+- 內建異常報酬清洗（可關）
+  1) 超限值平滑：若市場有漲跌幅限制（TW/CN/JP 可用 market_rules），abs(daily_ret) > limit*1.5 視為異常
+  2) pingpong：連續兩日 |ret| > 0.40 且方向相反，視為異常震盪（減資/併購/資料錯）
+- 可優先讀 stock_analysis（有 prev_close / market 等），沒有再退回 stock_prices
 
 用法：
     python kbar_aggregator.py tw_stock_warehouse.db
-或在程式裡呼叫：
-    from kbar_aggregator import build_kbars
-    build_kbars("tw_stock_warehouse.db")
+或：
+    from kbar_aggregator import build_kbar_tables
+    build_kbar_tables("tw_stock_warehouse.db")
 
+依賴（可選）：
+- market_rules.py（若存在，會用它拿 limit_up_pct / tick 等；不存在就 fallback）
 """
 
 import sys
 import sqlite3
-import warnings
-from dataclasses import dataclass
-from typing import Optional, Dict, Tuple
-
 import numpy as np
 import pandas as pd
+from typing import Optional, Dict
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+SQLITE_TIMEOUT = 120
 
-
-# =============================================================================
-# 可選：接 market_rules（若存在就用它的 limit/tick 規則做更精準清洗）
-# =============================================================================
+# -------------------------
+# optional market_rules
+# -------------------------
 try:
-    import market_rules  # 你的規則檔（若已完成）
+    import market_rules
     HAS_MARKET_RULES = True
 except Exception:
     market_rules = None
     HAS_MARKET_RULES = False
 
 
-# =============================================================================
-# 設定
-# =============================================================================
-PINGPONG_THRESHOLD = 0.40     # 你貼的：連續兩日 abs(ret)>0.4 且反向 → 異常
-LIMIT_SANITY_MULT = 1.50      # 有漲跌幅限制市場：abs(ret) > limit*1.5 視為異常
-MIN_DAYS_PER_SYMBOL = 40      # 太短的不做
-SQLITE_TIMEOUT = 120
-
-
-@dataclass
-class LimitRule:
-    kind: str                 # 'pct' / 'none'
-    up_pct: Optional[float]   # 0.10 / 0.20 / None
-
-
-def _fallback_limit_rule(market: confirm str, market_detail: str, symbol: str) -> LimitRule:
-    """
-    若 market_rules 不存在時的保底判斷：
-    - TW: listed/otc 10%, emerging none
-    - CN: 300/301/688 20% else 10%
-    - JP: none (你之後用 market_rules 補精準値幅)
-    """
+def _fallback_limit_up_pct(market: str, market_detail: str, symbol: str) -> Optional[float]:
+    """fallback：只做常見 TW=10%、CN=10/20、JP=None"""
     m = (market or "").upper().strip()
-    md = (market_detail or "").lower().strip()
     sym = (symbol or "").upper().strip()
+    md = (market_detail or "").lower().strip()
 
-    # TW
     if m in ["TW", "TSE", "GTSM"] or sym.endswith(".TW") or sym.endswith(".TWO"):
         if md == "emerging":
-            return LimitRule(kind="none", up_pct=None)
-        return LimitRule(kind="pct", up_pct=0.10)
+            return None
+        return 0.10
 
-    # CN
-    if m in ["SSE", "SZSE", "CN", "CHINA"] or sym.endswith(".SS") or sym.endswith(".SZ"):
+    if m in ["CN", "SSE", "SZSE", "CHINA"] or sym.endswith(".SS") or sym.endswith(".SZ"):
         code = "".join([c for c in sym if c.isdigit()])
         if code.startswith(("300", "301", "688")):
-            return LimitRule(kind="pct", up_pct=0.20)
-        return LimitRule(kind="pct", up_pct=0.10)
+            return 0.20
+        return 0.10
 
-    # JP
     if m in ["JP", "JPX", "TSE"] or sym.endswith(".T"):
-        return LimitRule(kind="none", up_pct=None)
+        return None
 
-    return LimitRule(kind="none", up_pct=None)
+    return None
 
 
-def _get_limit_rule(market: str, market_detail: str, symbol: str) -> LimitRule:
-    """
-    盡量用 market_rules.get_rule()，否則 fallback。
-    只拿「是否 pct limit」與「上限」用於 sanity check。
-    """
+def _get_limit_up_pct(market: str, market_detail: str, symbol: str) -> Optional[float]:
     if HAS_MARKET_RULES and hasattr(market_rules, "get_rule"):
         try:
-            r = market_rules.get_rule(market=market, market_detail=market_detail, symbol=symbol)
-            kind = r.get("limit_kind", "none")
-            up = r.get("limit_up_pct", None)
-            if kind == "pct" and isinstance(up, (int, float)):
-                return LimitRule(kind="pct", up_pct=float(up))
-            return LimitRule(kind="none", up_pct=None)
+            rule = market_rules.get_rule(market=market, market_detail=market_detail, symbol=symbol)
+            v = rule.get("limit_up_pct", None)
+            if isinstance(v, (int, float)):
+                return float(v)
+            return None
         except Exception:
-            pass
-    return _fallback_limit_rule(market, market_detail, symbol)
+            return _fallback_limit_up_pct(market, market_detail, symbol)
+    return _fallback_limit_up_pct(market, market_detail, symbol)
 
 
-# =============================================================================
-# 清洗：pingpong + limit sanity + 基礎修補
-# =============================================================================
-def _clean_daily(df: pd.DataFrame, limit_rule: LimitRule) -> pd.DataFrame:
+# -------------------------
+# anomaly cleaning (ADD-ON)
+# -------------------------
+def _apply_anomaly_cleaning(
+    g: pd.DataFrame,
+    limit_up_pct: Optional[float],
+    enable_pingpong: bool = True,
+    pingpong_threshold: float = 0.40,
+    enable_overlimit_smoothing: bool = True,
+) -> pd.DataFrame:
     """
-    df: 單一 symbol 的日K，需包含 date/open/high/low/close/volume
-    回傳清洗後 df（仍保持日頻），並新增 clean_ret
+    以「clean_close」生成乾淨價格序列，用於聚合，不破壞原 close。
+
+    策略（不 drop row，避免破壞週/月切段）：
+    - overlimit：把 OHLC 設 NaN -> 以 close ffill -> 其餘用 close 補
+    - pingpong：把 (i, i+1) 兩天 OHLC 設 NaN -> ffill
     """
+    g = g.sort_values("date").copy()
 
-    if df.empty:
-        return df
-
-    df = df.sort_values("date").reset_index(drop=True).copy()
-
-    # 基礎：價量無效
+    # clean_ohlc 初始 = 原始
     for c in ["open", "high", "low", "close"]:
-        df.loc[df[c].astype(float) <= 0, c] = np.nan
+        g[f"clean_{c}"] = pd.to_numeric(g[c], errors="coerce")
 
-    # 修補 close（因為 ret 依賴 close）
-    df["close"] = df["close"].astype(float).ffill()
+    # 先算 daily_ret（用 close）
+    g["clean_ret"] = g["clean_close"].pct_change()
 
-    # 用 close 算報酬
-    df["clean_ret"] = df["close"].pct_change().astype(float)
+    # 1) overlimit smoothing
+    if enable_overlimit_smoothing and isinstance(limit_up_pct, (int, float)) and limit_up_pct > 0:
+        max_allowed = float(limit_up_pct) * 1.5
+        mask_over = g["clean_ret"].abs() > max_allowed
+        if mask_over.any():
+            for c in ["clean_open", "clean_high", "clean_low", "clean_close"]:
+                g.loc[mask_over, c] = np.nan
 
-    # (1) limit sanity check（有漲跌幅限制市場）
-    if limit_rule.kind == "pct" and limit_rule.up_pct is not None:
-        max_abs = float(limit_rule.up_pct) * LIMIT_SANITY_MULT
-        bad = df["clean_ret"].abs() > max_abs
-        # 這些日子視為異常：把 OHLC 全設 NaN，再用 close ffill 讓聚合不炸
-        if bad.any():
-            for c in ["open", "high", "low", "close"]:
-                df.loc[bad, c] = np.nan
-            df["close"] = df["close"].ffill()
-            df["clean_ret"] = df["close"].pct_change().astype(float)
+    # 2) pingpong
+    if enable_pingpong:
+        r = g["clean_ret"].values
+        mask_pp = np.zeros(len(g), dtype=bool)
+        for i in range(0, len(g) - 2):
+            a = r[i + 0]
+            b = r[i + 1]
+            if np.isfinite(a) and np.isfinite(b):
+                if abs(a) > pingpong_threshold and abs(b) > pingpong_threshold and (a * b) < 0:
+                    mask_pp[i] = True
+                    mask_pp[i + 1] = True
+        if mask_pp.any():
+            for c in ["clean_open", "clean_high", "clean_low", "clean_close"]:
+                g.loc[mask_pp, c] = np.nan
 
-    # (2) pingpong filter（你貼的精神）
-    # 若 i 與 i+1 連續兩日 abs(ret)>threshold 且 ret 方向相反 → i, i+1 標記異常
-    r = df["clean_ret"].values
-    mask = np.zeros(len(df), dtype=bool)
-    for i in range(1, len(df) - 1):
-        prev = r[i]
-        nxt = r[i + 1]
-        if np.isfinite(prev) and np.isfinite(nxt):
-            if (abs(prev) > PINGPONG_THRESHOLD) and (abs(nxt) > PINGPONG_THRESHOLD) and (prev * nxt < 0):
-                mask[i] = True
-                mask[i + 1] = True
+    # ffill clean_close（核心）
+    g["clean_close"] = g["clean_close"].ffill()
 
-    if mask.any():
-        for c in ["open", "high", "low", "close"]:
-            df.loc[mask, c] = np.nan
-        df["close"] = df["close"].ffill()
-        df["clean_ret"] = df["close"].pct_change().astype(float)
+    # 其餘 OHLC 若 NaN，用 clean_close 補（保守）
+    for c in ["clean_open", "clean_high", "clean_low"]:
+        g[c] = g[c].fillna(g["clean_close"])
 
-    # 重新補 open/high/low（保守：用 close 近似補洞，確保聚合不中斷）
-    # 你若更想嚴格，可以改成：只 ffill close，不補 open/high/low，但聚合可能缺資料
-    df["open"] = df["open"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
+    # high/low 邏輯修正
+    g["clean_high"] = np.maximum.reduce([g["clean_high"], g["clean_open"], g["clean_close"]])
+    g["clean_low"] = np.minimum.reduce([g["clean_low"], g["clean_open"], g["clean_close"]])
 
-    df["open"] = df["open"].fillna(df["close"])
-    df["high"] = df["high"].fillna(df[["open", "close"]].max(axis=1))
-    df["low"] = df["low"].fillna(df[["open", "close"]].min(axis=1))
-
-    # volume
-    if "volume" in df.columns:
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype(float)
-    else:
-        df["volume"] = 0.0
-
-    return df
+    return g
 
 
-# =============================================================================
-# 聚合：由日K生成 週/月/年
-# =============================================================================
-def _agg_ohlcv(g: pd.DataFrame) -> pd.Series:
-    """對單一 period 的 OHLCV 聚合"""
+# -------------------------
+# aggregation helpers
+# -------------------------
+def _agg_period(g: pd.DataFrame) -> Dict[str, float]:
+    """
+    g：該 period 的日K（已含 clean_*）
+    回傳 period OHLCV（用 clean_OHLC + 原 volume）
+    """
     if g.empty:
-        return pd.Series({"open": np.nan, "high": np.nan, "low": np.nan, "close": np.nan, "volume": 0.0})
+        return dict(open=np.nan, high=np.nan, low=np.nan, close=np.nan, volume=0.0)
 
-    return pd.Series(
-        {
-            "open": float(g["open"].iloc[0]),
-            "high": float(np.nanmax(g["high"].values)),
-            "low": float(np.nanmin(g["low"].values)),
-            "close": float(g["close"].iloc[-1]),
-            "volume": float(np.nansum(g["volume"].values)),
-        }
-    )
+    open_ = float(g["clean_open"].iloc[0]) if np.isfinite(g["clean_open"].iloc[0]) else np.nan
+    close_ = float(g["clean_close"].iloc[-1]) if np.isfinite(g["clean_close"].iloc[-1]) else np.nan
+    high_ = float(np.nanmax(g["clean_high"].values)) if np.isfinite(np.nanmax(g["clean_high"].values)) else np.nan
+    low_ = float(np.nanmin(g["clean_low"].values)) if np.isfinite(np.nanmin(g["clean_low"].values)) else np.nan
+    vol_ = float(np.nansum(pd.to_numeric(g["volume"], errors="coerce").fillna(0).values))
+    return dict(open=open_, high=high_, low=low_, close=close_, volume=vol_)
 
 
-def _build_weekly(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    週K：以 ISO week 做週期鍵（跨年週會歸到 ISO year）
-    period_end：週最後一個交易日（實際存在的日K最後一天）
-    """
-    x = df.copy()
-    iso = x["date"].dt.isocalendar()
-    x["iso_year"] = iso["year"].astype(int)
-    x["iso_week"] = iso["week"].astype(int)
-    x["period_key"] = x["iso_year"].astype(str) + "-W" + x["iso_week"].astype(str).str.zfill(2)
-
-    out = (
-        x.groupby("period_key", sort=True)
-        .apply(_agg_ohlcv)
-        .reset_index()
-        .rename(columns={"period_key": "week_id"})
-    )
-
-    # start/end date
-    se = x.groupby("period_key")["date"].agg(["min", "max"]).reset_index()
-    se.columns = ["week_id", "period_start", "period_end"]
-    out = out.merge(se, on="week_id", how="left")
-
-    # year/week
-    out["year"] = out["week_id"].str.slice(0, 4).astype(int)
-    out["week"] = out["week_id"].str.split("-W").str[1].astype(int)
-
-    return out[["week_id", "year", "week", "period_start", "period_end", "open", "high", "low", "close", "volume"]]
-
-
-def _build_monthly(df: pd.DataFrame) -> pd.DataFrame:
-    x = df.copy()
-    x["year"] = x["date"].dt.year.astype(int)
-    x["month"] = x["date"].dt.month.astype(int)
-    x["month_id"] = x["year"].astype(str) + "-" + x["month"].astype(str).str.zfill(2)
-
-    out = x.groupby("month_id", sort=True).apply(_agg_ohlcv).reset_index()
-    se = x.groupby("month_id")["date"].agg(["min", "max"]).reset_index()
-    se.columns = ["month_id", "period_start", "period_end"]
-    out = out.merge(se, on="month_id", how="left")
-
-    out["year"] = out["month_id"].str.slice(0, 4).astype(int)
-    out["month"] = out["month_id"].str.slice(5, 7).astype(int)
-
-    return out[["month_id", "year", "month", "period_start", "period_end", "open", "high", "low", "close", "volume"]]
-
-
-def _build_yearly(df: pd.DataFrame) -> pd.DataFrame:
-    x = df.copy()
-    x["year"] = x["date"].dt.year.astype(int)
-    x["year_id"] = x["year"].astype(str)
-
-    out = x.groupby("year_id", sort=True).apply(_agg_ohlcv).reset_index()
-    se = x.groupby("year_id")["date"].agg(["min", "max"]).reset_index()
-    se.columns = ["year_id", "period_start", "period_end"]
-    out = out.merge(se, on="year_id", how="left")
-
-    out["year"] = out["year_id"].astype(int)
-
-    # 年內高點（用 high）
-    peak = x.groupby("year_id").apply(lambda g: pd.Series({
-        "year_peak_date": g.loc[g["high"].astype(float).idxmax(), "date"] if len(g) else pd.NaT,
-        "year_peak_high": float(np.nanmax(g["high"].astype(float).values)) if len(g) else np.nan
-    })).reset_index().rename(columns={"year_id": "year_id"})
-
-    out = out.merge(peak, left_on="year_id", right_on="year_id", how="left")
-    return out[["year_id", "year", "period_start", "period_end", "open", "high", "low", "close", "volume", "year_peak_date", "year_peak_high"]]
-
-
-# =============================================================================
-# DB IO
-# =============================================================================
-def _ensure_indexes(conn: sqlite3.Connection):
-    # 日K索引（如果沒有）
-    try:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_symbol_date ON stock_prices(symbol, date)")
-    except Exception:
-        pass
-
-
-def _write_table(conn: sqlite3.Connection, name: str, df: pd.DataFrame):
-    conn.execute(f"DROP TABLE IF EXISTS {name}")
-    df.to_sql(name, conn, if_exists="replace", index=False)
-
-    # 常用索引
-    try:
-        if name == "kbar_weekly":
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_weekly_symbol_end ON kbar_weekly(symbol, period_end)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_weekly_symbol_week ON kbar_weekly(symbol, week_id)")
-        elif name == "kbar_monthly":
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_monthly_symbol_end ON kbar_monthly(symbol, period_end)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_monthly_symbol_month ON kbar_monthly(symbol, month_id)")
-        elif name == "kbar_yearly":
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_yearly_symbol_year ON kbar_yearly(symbol, year)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_yearly_symbol_end ON kbar_yearly(symbol, period_end)")
-    except Exception:
-        pass
-
-
-# =============================================================================
-# 主函數
-# =============================================================================
-def build_kbars(db_path: str, symbols: Optional[list] = None) -> Dict[str, int]:
-    """
-    讀 stock_prices → 清洗 → 聚合 → 寫回 kbar_weekly/monthly/yearly
-    回傳統計 dict
-    """
-
+def build_kbar_tables(
+    db_path: str,
+    source_table_prefer: str = "stock_analysis",
+    enable_anomaly_cleaning: bool = True,
+    enable_pingpong: bool = True,
+    pingpong_threshold: float = 0.40,
+    enable_overlimit_smoothing: bool = True,
+) -> Dict[str, int]:
     conn = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT)
-    try:
-        _ensure_indexes(conn)
 
-        # 讀 stock_prices + stock_info（market判定用）
-        query = """
-        SELECT p.symbol, p.date, p.open, p.high, p.low, p.close, p.volume,
-               i.market, i.market_detail
-        FROM stock_prices p
-        LEFT JOIN stock_info i ON p.symbol = i.symbol
-        """
-        df = pd.read_sql(query, conn)
+    try:
+        existing = set(pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)["name"].tolist())
+
+        # 選來源
+        source = None
+        if source_table_prefer in existing:
+            source = source_table_prefer
+        elif "stock_prices" in existing:
+            source = "stock_prices"
+        else:
+            raise RuntimeError("找不到 stock_analysis 或 stock_prices，請先跑 downloader + processor")
+
+        # 讀資料（若是 stock_prices 可能沒有 market / market_detail，盡量 join stock_info）
+        if source == "stock_analysis":
+            df = pd.read_sql(
+                """
+                SELECT symbol, date, open, high, low, close, volume,
+                       market, market_detail
+                FROM stock_analysis
+                """,
+                conn,
+            )
+        else:
+            if "stock_info" in existing:
+                df = pd.read_sql(
+                    """
+                    SELECT p.symbol, p.date, p.open, p.high, p.low, p.close, p.volume,
+                           i.market, i.market_detail
+                    FROM stock_prices p
+                    LEFT JOIN stock_info i ON p.symbol = i.symbol
+                    """,
+                    conn,
+                )
+            else:
+                df = pd.read_sql(
+                    "SELECT symbol, date, open, high, low, close, volume FROM stock_prices",
+                    conn,
+                )
+                df["market"] = ""
+                df["market_detail"] = ""
 
         if df.empty:
-            print("❌ stock_prices 無資料")
-            return {"symbols": 0, "weekly_rows": 0, "monthly_rows": 0, "yearly_rows": 0}
+            print("❌ 無日K資料")
+            return {"weekly": 0, "monthly": 0, "yearly": 0}
 
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.dropna(subset=["date"]).sort_values(["symbol", "date"]).reset_index(drop=True)
 
-        if symbols:
-            sset = set(symbols)
-            df = df[df["symbol"].isin(sset)].copy()
-            if df.empty:
-                print("❌ 指定 symbols 在 DB 找不到資料")
-                return {"symbols": 0, "weekly_rows": 0, "monthly_rows": 0, "yearly_rows": 0}
-
-        wk_list, mo_list, yr_list = [], [], []
-        symbol_count = 0
+        weekly_rows = []
+        monthly_rows = []
+        yearly_rows = []
 
         for sym, g in df.groupby("symbol", sort=False):
-            g = g.sort_values("date").reset_index(drop=True)
-            if len(g) < MIN_DAYS_PER_SYMBOL:
+            g = g.sort_values("date").copy()
+            if len(g) < 10:
                 continue
 
             market = g["market"].iloc[0] if "market" in g.columns else ""
             market_detail = g["market_detail"].iloc[0] if "market_detail" in g.columns else ""
+            limit_up_pct = _get_limit_up_pct(market, market_detail, sym)
 
-            rule = _get_limit_rule(market, market_detail, sym)
+            # 異常清洗（產生 clean_*）
+            if enable_anomaly_cleaning:
+                g = _apply_anomaly_cleaning(
+                    g,
+                    limit_up_pct=limit_up_pct,
+                    enable_pingpong=enable_pingpong,
+                    pingpong_threshold=pingpong_threshold,
+                    enable_overlimit_smoothing=enable_overlimit_smoothing,
+                )
+            else:
+                for c in ["open", "high", "low", "close"]:
+                    g[f"clean_{c}"] = pd.to_numeric(g[c], errors="coerce")
 
-            gd = _clean_daily(g, rule)
-            if gd.empty or gd["close"].isna().all():
-                continue
+            g["year"] = g["date"].dt.year.astype(int)
 
-            # 聚合
-            w = _build_weekly(gd)
-            w.insert(0, "symbol", sym)
-            m = _build_monthly(gd)
-            m.insert(0, "symbol", sym)
-            y = _build_yearly(gd)
-            y.insert(0, "symbol", sym)
+            # ========== weekly ==========
+            # 週定義：Mon~Sun（pandas 'W-SUN'）
+            # period_end = 該週週日，period_start = 週一
+            g["week_end"] = g["date"].dt.to_period("W-SUN").dt.end_time.dt.normalize()
+            wk_groups = g.groupby(["year", "week_end"], sort=False)
 
-            wk_list.append(w)
-            mo_list.append(m)
-            yr_list.append(y)
+            for (yr, week_end), wg in wk_groups:
+                if wg.empty:
+                    continue
+                week_end = pd.Timestamp(week_end).normalize()
+                week_start = (week_end - pd.Timedelta(days=6)).normalize()
+                ohlcv = _agg_period(wg)
+                # week_id 用 ISO year-week（以 week_end 計）
+                iso = week_end.isocalendar()
+                week_id = f"{int(iso.year)}-W{int(iso.week):02d}"
+                weekly_rows.append(
+                    {
+                        "symbol": sym,
+                        "year": int(yr),
+                        "week_id": week_id,
+                        "period_start": week_start.strftime("%Y-%m-%d"),
+                        "period_end": week_end.strftime("%Y-%m-%d"),
+                        **ohlcv,
+                    }
+                )
 
-            symbol_count += 1
+            # ========== monthly ==========
+            g["month_end"] = g["date"].dt.to_period("M").dt.end_time.dt.normalize()
+            mo_groups = g.groupby(["year", "month_end"], sort=False)
 
-        if symbol_count == 0:
-            print("❌ 沒有足夠資料可聚合（可能都不足 MIN_DAYS_PER_SYMBOL）")
-            return {"symbols": 0, "weekly_rows": 0, "monthly_rows": 0, "yearly_rows": 0}
+            for (yr, month_end), mg in mo_groups:
+                if mg.empty:
+                    continue
+                month_end = pd.Timestamp(month_end).normalize()
+                month_start = pd.Timestamp(month_end.replace(day=1)).normalize()
+                ohlcv = _agg_period(mg)
+                month_id = month_start.strftime("%Y-%m")
+                monthly_rows.append(
+                    {
+                        "symbol": sym,
+                        "year": int(yr),
+                        "month_id": month_id,
+                        "period_start": month_start.strftime("%Y-%m-%d"),
+                        "period_end": month_end.strftime("%Y-%m-%d"),
+                        **ohlcv,
+                    }
+                )
 
-        df_wk = pd.concat(wk_list, ignore_index=True)
-        df_mo = pd.concat(mo_list, ignore_index=True)
-        df_yr = pd.concat(yr_list, ignore_index=True)
+            # ========== yearly ==========
+            yr_groups = g.groupby("year", sort=False)
+            for yr, yg in yr_groups:
+                if yg.empty:
+                    continue
+                period_start = pd.Timestamp(f"{int(yr)}-01-01")
+                period_end = pd.Timestamp(f"{int(yr)}-12-31")
+                # 實際以該年資料 min/max date 當 period_start/end（更合理）
+                period_start = pd.Timestamp(yg["date"].min()).normalize()
+                period_end = pd.Timestamp(yg["date"].max()).normalize()
 
-        # 日期欄位轉字串（SQLite穩）
-        for col in ["period_start", "period_end"]:
-            df_wk[col] = pd.to_datetime(df_wk[col]).dt.strftime("%Y-%m-%d")
-            df_mo[col] = pd.to_datetime(df_mo[col]).dt.strftime("%Y-%m-%d")
-            df_yr[col] = pd.to_datetime(df_yr[col]).dt.strftime("%Y-%m-%d")
+                ohlcv = _agg_period(yg)
 
-        df_yr["year_peak_date"] = pd.to_datetime(df_yr["year_peak_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                # 年高點：用 clean_high 找 peak date
+                idx = yg["clean_high"].astype(float).idxmax()
+                year_peak_date = None
+                year_peak_high = np.nan
+                if pd.notna(idx) and idx in yg.index:
+                    year_peak_date = pd.Timestamp(yg.loc[idx, "date"]).normalize()
+                    year_peak_high = float(yg.loc[idx, "clean_high"]) if np.isfinite(yg.loc[idx, "clean_high"]) else np.nan
 
-        # 寫回
-        _write_table(conn, "kbar_weekly", df_wk)
-        _write_table(conn, "kbar_monthly", df_mo)
-        _write_table(conn, "kbar_yearly", df_yr)
+                yearly_rows.append(
+                    {
+                        "symbol": sym,
+                        "year": int(yr),
+                        "period_start": period_start.strftime("%Y-%m-%d"),
+                        "period_end": period_end.strftime("%Y-%m-%d"),
+                        **ohlcv,
+                        "year_peak_date": year_peak_date.strftime("%Y-%m-%d") if year_peak_date is not None else None,
+                        "year_peak_high": year_peak_high,
+                    }
+                )
+
+        wk_df = pd.DataFrame(weekly_rows)
+        mo_df = pd.DataFrame(monthly_rows)
+        yr_df = pd.DataFrame(yearly_rows)
+
+        # 寫回（重建）
+        conn.execute("DROP TABLE IF EXISTS kbar_weekly")
+        conn.execute("DROP TABLE IF EXISTS kbar_monthly")
+        conn.execute("DROP TABLE IF EXISTS kbar_yearly")
+
+        wk_df.to_sql("kbar_weekly", conn, if_exists="replace", index=False)
+        mo_df.to_sql("kbar_monthly", conn, if_exists="replace", index=False)
+        yr_df.to_sql("kbar_yearly", conn, if_exists="replace", index=False)
+
+        # 索引
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_w_sym_year ON kbar_weekly(symbol, year)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_m_sym_year ON kbar_monthly(symbol, year)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kbar_y_sym_year ON kbar_yearly(symbol, year)")
+        except Exception:
+            pass
 
         conn.commit()
 
-        print("\n✅ kbar 聚合完成（由日K聚合，已清洗）")
-        print(f"📌 symbols: {symbol_count}")
-        print(f"📌 kbar_weekly rows:  {len(df_wk):,}")
-        print(f"📌 kbar_monthly rows: {len(df_mo):,}")
-        print(f"📌 kbar_yearly rows:  {len(df_yr):,}")
+        print("\n✅ kbar_aggregator 完成（已產生週/月/年 K）")
+        print(f"📌 kbar_weekly: {len(wk_df):,} rows")
+        print(f"📌 kbar_monthly: {len(mo_df):,} rows")
+        print(f"📌 kbar_yearly: {len(yr_df):,} rows")
+        print(f"📌 異常清洗: {'ON' if enable_anomaly_cleaning else 'OFF'} (pingpong={enable_pingpong}, thr={pingpong_threshold})")
 
-        return {
-            "symbols": int(symbol_count),
-            "weekly_rows": int(len(df_wk)),
-            "monthly_rows": int(len(df_mo)),
-            "yearly_rows": int(len(df_yr)),
-        }
+        return {"weekly": int(len(wk_df)), "monthly": int(len(mo_df)), "yearly": int(len(yr_df))}
 
     finally:
         conn.close()
@@ -416,9 +369,7 @@ def build_kbars(db_path: str, symbols: Optional[list] = None) -> Dict[str, int]:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python kbar_aggregator.py <db_path> [symbol1 symbol2 ...]")
+        print("Usage: python kbar_aggregator.py <db_path>")
         sys.exit(1)
 
-    db = sys.argv[1]
-    syms = sys.argv[2:] if len(sys.argv) > 2 else None
-    build_kbars(db, symbols=syms)
+    build_kbar_tables(sys.argv[1])
