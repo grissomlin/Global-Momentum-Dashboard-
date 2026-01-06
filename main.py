@@ -30,13 +30,22 @@ socket.setdefaulttimeout(SOCKET_TIMEOUT)
 
 GDRIVE_FOLDER_ID = os.environ.get(ENV_GDRIVE_FOLDER_ID)
 
-
 # 2) 導入特徵加工模組（保留 processor）
 try:
     from processor import process_market_data
 except ImportError:
     print("⚠️ 系統提示：找不到 processor.py，將跳過特徵處理")
     process_market_data = None
+
+# 2.5) 導入事件表引擎（limitup_events / daytrade_events）
+try:
+    from event_engine import build_events
+except ImportError:
+    print("⚠️ 系統提示：找不到 event_engine.py，將跳過事件表生成")
+    build_events = None
+
+# ✅ 只針對這些市場跑事件表（其他市場跳過）
+EVENT_ENGINE_MARKETS = {"tw", "cn", "jp"}
 
 
 def load_downloader(module_name: str):
@@ -153,6 +162,21 @@ def process_market(market_code: str, drive_service):
                     print(f"❌ 特徵處理失敗: {e}")
             else:
                 print("⚠️ 跳過特徵處理 (未載入 processor)")
+
+            # (D2) 事件表生成：只針對 tw/cn/jp
+            if market_code in EVENT_ENGINE_MARKETS:
+                if build_events:
+                    try:
+                        print("🧩 開始生成事件表 (limitup_events / daytrade_events)...")
+                        t2 = time.time()
+                        build_events(db_file)
+                        print(f"✅ 事件表生成完成，耗時: {time.time()-t2:.1f}秒")
+                    except Exception as e:
+                        print(f"❌ 事件表生成失敗: {e}")
+                else:
+                    print("⚠️ 跳過事件表生成 (未載入 event_engine)")
+            else:
+                print(f"⏭️ 跳過事件表生成（{market_code.upper()} 不在事件表目標市場 {sorted(EVENT_ENGINE_MARKETS)}）")
 
             # (E) 雲端上傳（穩定性上傳）
             if drive_service and GDRIVE_FOLDER_ID:
