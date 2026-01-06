@@ -4,18 +4,21 @@ event_engine.py
 ---------------
 獨立事件表：專門給「漲停型態」與「隔日沖/衝漲停」研究使用（乾淨、可擴充）
 
-輸入：同一個 db (stock_prices + stock_info)
+輸入：同一個 db (stock_prices + stock_info)；可選讀 stock_analysis
 輸出：兩張表
 1) limitup_events：每一筆「當日漲停(或 pseudo-limit)事件」+ 型態 + 未來報酬
 2) daytrade_events：更廣義：昨日漲停/今日漲停/今日衝漲停失敗 等事件標記 + 未來報酬
 
-依賴：market_rules.py
+新增欄位（隔日沖重要）：
+- is_one_tick_lock (一字鎖)
+- consecutive_limits (連板天數；優先從 stock_analysis，否則 fallback 自算)
+- next_open_ret / next_open_gap
+- next_intraday_drawdown = (next_low / next_open - 1)
 """
 
 from __future__ import annotations
 import sqlite3
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Tuple
 from datetime import datetime
 
 import numpy as np
@@ -29,6 +32,22 @@ from market_rules import MarketConfig
 # -----------------------
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}", flush=True)
+
+
+def table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone()
+    return bool(row)
+
+
+def column_exists(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    try:
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        return col in cols
+    except Exception:
+        return False
 
 
 def ensure_tables(conn: sqlite3.Connection):
@@ -62,8 +81,19 @@ def ensure_tables(conn: sqlite3.Connection):
             lu_type_raw TEXT,
             lu_type_4 TEXT,
 
+            -- 新增：一字鎖/連板/隔日沖關鍵欄位
+            is_one_tick_lock INTEGER,
+            consecutive_limits INTEGER,
+
+            next_open REAL,
+            next_low REAL,
+            next_open_ret REAL,
+            next_open_gap REAL,
+            next_intraday_drawdown REAL,
+
             next1d_ret_close REAL,
             next1d_ret_high REAL,
+            next5d_ret_close REAL,
             fwd_max_up_1_5d REAL,
             fwd_max_down_1_5d REAL,
 
@@ -103,6 +133,16 @@ def ensure_tables(conn: sqlite3.Connection):
             y_limit_today_gapdown INTEGER,
             y_limit_today_red INTEGER,
 
+            -- 新增：一字鎖/連板/隔日沖關鍵欄位
+            is_one_tick_lock INTEGER,
+            consecutive_limits INTEGER,
+
+            next_open REAL,
+            next_low REAL,
+            next_open_ret REAL,
+            next_open_gap REAL,
+            next_intraday_drawdown REAL,
+
             next1d_ret_close REAL,
             next1d_ret_high REAL,
             next5d_ret_close REAL,
@@ -122,10 +162,7 @@ def ensure_tables(conn: sqlite3.Connection):
 
 def load_price_data(conn: sqlite3.Connection) -> pd.DataFrame:
     """
-    從 stock_prices + stock_info 拉出完整日K
-    DB schema 以你現在 processor.py 相容版為準：
-    - stock_prices: symbol,date,open,high,low,close,volume
-    - stock_info  : symbol,name,sector,market,market_detail
+    stock_prices + stock_info
     """
     q = """
     SELECT
@@ -142,21 +179,59 @@ def load_price_data(conn: sqlite3.Connection) -> pd.DataFrame:
     return df
 
 
+def load_consecutive_limits_from_stock_analysis(conn: sqlite3.Connection) -> pd.DataFrame:
+    """
+    嘗試從 stock_analysis 取出 (symbol,date,consecutive_limits)
+    若不存在/沒欄位，回傳空 df
+    """
+    if not table_exists(conn, "stock_analysis"):
+        return pd.DataFrame(columns=["symbol", "date", "consecutive_limits"])
+
+    if not column_exists(conn, "stock_analysis", "consecutive_limits"):
+        return pd.DataFrame(columns=["symbol", "date", "consecutive_limits"])
+
+    q = "SELECT symbol, date, consecutive_limits FROM stock_analysis"
+    df = pd.read_sql(q, conn)
+    if df.empty:
+        return pd.DataFrame(columns=["symbol", "date", "consecutive_limits"])
+    df["date"] = pd.to_datetime(df["date"])
+    df["consecutive_limits"] = pd.to_numeric(df["consecutive_limits"], errors="coerce").fillna(0).astype(int)
+    return df
+
+
 def calc_forward_metrics(group: pd.DataFrame) -> pd.DataFrame:
     """
-    針對單一 symbol：算隔日/5日/1~5日最大上漲下跌（用 close / high / low）
+    對單一 symbol 計算：隔日/5日/1~5日最大上漲下跌 + 隔日開盤/低點衍生欄位
     """
     g = group.copy()
+
+    # next-day raw
     g["close_next1"] = g["close"].shift(-1)
     g["high_next1"] = g["high"].shift(-1)
+    g["low_next1"] = g["low"].shift(-1)
+    g["open_next1"] = g["open"].shift(-1)
+
+    # next 5d close
     g["close_next5"] = g["close"].shift(-5)
 
+    # base returns
     g["next1d_ret_close"] = (g["close_next1"] / g["close"] - 1.0) * 100
     g["next1d_ret_high"] = (g["high_next1"] / g["close"] - 1.0) * 100
     g["next5d_ret_close"] = (g["close_next5"] / g["close"] - 1.0) * 100
 
-    # 1~5 日最大上漲：max(high[t+1..t+5]) / close[t] - 1
-    # 1~5 日最大下跌：min(low[t+1..t+5]) / close[t] - 1
+    # --- 隔日沖關鍵欄位 ---
+    # next_open_ret：以今日收盤為基準看隔日開盤強弱
+    g["next_open"] = g["open_next1"]
+    g["next_low"] = g["low_next1"]
+    g["next_open_ret"] = (g["next_open"] / g["close"] - 1.0) * 100
+
+    # next_open_gap：隔日「相對昨收」開盤跳空（其實 next_prev_close 就是今日 close）
+    g["next_open_gap"] = (g["next_open"] / g["close"] - 1.0) * 100
+
+    # next_intraday_drawdown：隔日從開盤到低點回撤
+    g["next_intraday_drawdown"] = (g["next_low"] / g["next_open"] - 1.0) * 100
+
+    # 1~5 日最大上漲/下跌（用 high/low）
     fwd_high_1_5 = []
     fwd_low_1_5 = []
     highs = g["high"].to_numpy()
@@ -183,21 +258,13 @@ def calc_forward_metrics(group: pd.DataFrame) -> pd.DataFrame:
 
     g["fwd_max_up_1_5d"] = fwd_high_1_5
     g["fwd_max_down_1_5d"] = fwd_low_1_5
+
     return g
 
 
 def classify_limitup_type(row: pd.Series) -> Tuple[str, str]:
     """
-    依你文章的規則：先做 7 類 raw，再合併成 4 大類（+OTHER）
-    規則（以日K近似）：
-    1) is_gap : (open/prev_close - 1) >= 0.07
-    2) is_high_vol: volume/vol_ma5 >= 3
-    3) is_low_vol : volume/vol_ma5 <= 0.4
-    4) is_float   : (not is_gap) and (close/open - 1 >= 0.05)
-    5) 優先序：
-       GAP_UP_LOCK, GAP_UP, FLOAT_HV, FLOAT, LOW_VOL_LOCK, HIGH_VOL_LOCK, OTHER
-    最後合併：
-       FLOATING / GAP_UP / HIGH_VOLUME_LOCK / NO_VOLUME_LOCK / OTHER
+    你文章的 7 類 raw + 4 類合併（+OTHER）
     """
     prev_close = row.get("prev_close")
     o = row.get("open")
@@ -214,7 +281,6 @@ def classify_limitup_type(row: pd.Series) -> Tuple[str, str]:
     low_vol = (vol_ratio <= 0.4) if np.isfinite(vol_ratio) else False
     is_float = (not gap) and ((c / o - 1.0) >= 0.05) if o > 0 else False
 
-    # raw 7-class
     if gap and low_vol:
         raw = "GAP_UP_LOCK"
     elif gap:
@@ -230,7 +296,6 @@ def classify_limitup_type(row: pd.Series) -> Tuple[str, str]:
     else:
         raw = "OTHER"
 
-    # merge to 4 (+OTHER)
     if raw in ("FLOAT", "FLOAT_HV"):
         merged = "FLOATING"
     elif raw in ("GAP_UP", "GAP_UP_LOCK"):
@@ -245,36 +310,46 @@ def classify_limitup_type(row: pd.Series) -> Tuple[str, str]:
     return raw, merged
 
 
+def calc_consecutive_limits_fallback(group: pd.DataFrame) -> pd.Series:
+    """
+    fallback：若 stock_analysis 沒有 consecutive_limits，就用 is_limit_up 自算
+    """
+    is_lu = group["is_limit_up"].fillna(0).astype(int)
+    # streak 計算：遇到 0 會重置
+    streak = is_lu.groupby((is_lu != is_lu.shift()).cumsum()).cumsum()
+    out = np.where(is_lu == 1, streak, 0)
+    return pd.Series(out, index=group.index, dtype="int64")
+
+
 def build_events(db_path: str):
     conn = sqlite3.connect(db_path, timeout=120)
     try:
         ensure_tables(conn)
+
         df = load_price_data(conn)
         if df.empty:
             log("❌ stock_prices 為空，無法建立事件表")
             return
 
-        # 基礎欄位（逐股計算）
+        # 基礎欄位
         df["prev_close"] = df.groupby("symbol")["close"].shift(1)
         df["daily_change"] = df.groupby("symbol")["close"].pct_change()
         df["daily_change_pct"] = df["daily_change"] * 100
 
-        # vol_ma5 / ratio
         df["vol_ma5"] = df.groupby("symbol")["volume"].transform(lambda s: s.rolling(5, min_periods=1).mean())
         df["vol_ratio_ma5"] = df["volume"] / df["vol_ma5"]
 
-        # forward metrics
+        # forward metrics（含 next_open_ret / drawdown）
         df = df.groupby("symbol", group_keys=False).apply(calc_forward_metrics)
 
-        # 計算漲停 / 跌停（依市場規則）
+        # 漲停/跌停計算
+        df["market"] = df["market"].fillna("")
+        df["market_detail"] = df["market_detail"].fillna("unknown")
+
         limit_up_prices = []
         is_limit_ups = []
         hit_limits = []
         is_limit_downs = []
-
-        # 先把市場資訊缺失補 default
-        df["market"] = df["market"].fillna("")
-        df["market_detail"] = df["market_detail"].fillna("unknown")
 
         for r in df.itertuples(index=False):
             symbol = r.symbol
@@ -291,7 +366,6 @@ def build_events(db_path: str):
             is_lu = MarketConfig.is_limit_up(close, prev_close, rule) if (prev_close is not None and close is not None) else 0
             is_ld = MarketConfig.is_limit_down(close, prev_close, rule) if (prev_close is not None and close is not None) else 0
 
-            # hit_limit：盤中有碰到（用 high 判斷）
             hit = 0
             if up is not None and high is not None:
                 hit = int(float(high) >= float(up) * 0.999)
@@ -305,6 +379,14 @@ def build_events(db_path: str):
         df["hit_limit"] = hit_limits
         df["is_limit_down"] = is_limit_downs
 
+        # 一字鎖（嚴格版：open=close=high=low 且當天是漲停）
+        df["is_one_tick_lock"] = (
+            (df["is_limit_up"] == 1) &
+            (df["open"] == df["close"]) &
+            (df["high"] == df["low"]) &
+            (df["open"] == df["high"])
+        ).astype(int)
+
         # 型態分類
         raw_types = []
         merged_types = []
@@ -315,33 +397,34 @@ def build_events(db_path: str):
         df["lu_type_raw"] = raw_types
         df["lu_type_4"] = merged_types
 
-        # 昨日資訊（隔日沖研究用）
+        # 連板天數：優先 stock_analysis
+        cons_df = load_consecutive_limits_from_stock_analysis(conn)
+        if not cons_df.empty:
+            df = df.merge(cons_df, on=["symbol", "date"], how="left")
+            df["consecutive_limits"] = df["consecutive_limits"].fillna(0).astype(int)
+            log("✅ consecutive_limits：使用 stock_analysis 欄位")
+        else:
+            df["consecutive_limits"] = df.groupby("symbol", group_keys=False).apply(calc_consecutive_limits_fallback)
+            log("✅ consecutive_limits：stock_analysis 不可用，已 fallback 自算")
+
+        # 昨日資訊（隔日沖旗標）
         df["prev_is_limit_up"] = df.groupby("symbol")["is_limit_up"].shift(1).fillna(0).astype(int)
         df["prev_hit_limit"] = df.groupby("symbol")["hit_limit"].shift(1).fillna(0).astype(int)
 
-        # 隔日沖常用事件旗標
-        # 1) 昨天漲停，今天沒漲停
         df["y_limit_today_not_limit"] = ((df["prev_is_limit_up"] == 1) & (df["is_limit_up"] == 0)).astype(int)
-
-        # 2) 昨天沒漲停，但今天「衝漲停失敗」（盤中碰到上限，但收盤沒鎖）
         df["y_not_limit_today_fail_limit"] = ((df["prev_is_limit_up"] == 0) & (df["hit_limit"] == 1) & (df["is_limit_up"] == 0)).astype(int)
-
-        # 3) 昨天漲停，今天開低（常見隔日沖反向壓力）
         df["y_limit_today_gapdown"] = ((df["prev_is_limit_up"] == 1) & (df["open"] < df["prev_close"])).astype(int)
-
-        # 4) 昨天漲停，今天收黑（隔日沖出貨可能）
         df["y_limit_today_red"] = ((df["prev_is_limit_up"] == 1) & (df["close"] < df["open"])).astype(int)
 
         # -----------------------
-        # 寫入兩張事件表
+        # 輸出兩張表
         # -----------------------
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         df_out = df.copy()
         df_out["date"] = df_out["date"].dt.strftime("%Y-%m-%d")
         df_out["created_at"] = now
 
-        # limitup_events：只保留「當日漲停(或 pseudo-limit)」事件
-        # 你要 US/HK 用 10% 當漲停 → 這裡 is_limit_up 已含 pseudo
+        # limitup_events：只取當日漲停（含 pseudo-limit）
         limitup_df = df_out[df_out["is_limit_up"] == 1].copy()
 
         limitup_keep = [
@@ -351,12 +434,14 @@ def build_events(db_path: str):
             "limit_up_price","is_limit_up","hit_limit","is_limit_down",
             "vol_ma5","vol_ratio_ma5",
             "lu_type_raw","lu_type_4",
-            "next1d_ret_close","next1d_ret_high","fwd_max_up_1_5d","fwd_max_down_1_5d",
+            "is_one_tick_lock","consecutive_limits",
+            "next_open","next_low","next_open_ret","next_open_gap","next_intraday_drawdown",
+            "next1d_ret_close","next1d_ret_high","next5d_ret_close","fwd_max_up_1_5d","fwd_max_down_1_5d",
             "created_at"
         ]
         limitup_df = limitup_df[limitup_keep]
 
-        # daytrade_events：保留「所有交易日」但帶事件旗標（隔日沖研究最乾淨）
+        # daytrade_events：全交易日 + 旗標
         daytrade_keep = [
             "symbol","date","market","market_detail","name","sector",
             "prev_close","open","high","low","close","volume",
@@ -367,13 +452,15 @@ def build_events(db_path: str):
             "y_not_limit_today_fail_limit",
             "y_limit_today_gapdown",
             "y_limit_today_red",
+            "is_one_tick_lock","consecutive_limits",
+            "next_open","next_low","next_open_ret","next_open_gap","next_intraday_drawdown",
             "next1d_ret_close","next1d_ret_high","next5d_ret_close",
             "fwd_max_up_1_5d","fwd_max_down_1_5d",
             "created_at"
         ]
         daytrade_df = df_out[daytrade_keep].copy()
 
-        # 清掉舊資料（可改成增量 upsert，但先用 replace 最直覺）
+        # 重建表（乾淨）
         log("🧹 重新建立事件表（DROP + REPLACE）...")
         conn.execute("DROP TABLE IF EXISTS limitup_events")
         conn.execute("DROP TABLE IF EXISTS daytrade_events")
@@ -390,7 +477,6 @@ def build_events(db_path: str):
         conn.execute("VACUUM")
         conn.commit()
 
-        # 簡單摘要
         log("✅ 完成 event_engine 建表")
         log(f"   - limitup_events: {len(limitup_df):,}")
         log(f"   - daytrade_events: {len(daytrade_df):,}")
