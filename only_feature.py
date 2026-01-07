@@ -41,7 +41,7 @@ def download_db_from_drive(service, db_file: str, folder_id: str) -> bool:
             service=service,
             folder_id=folder_id,
             file_name=db_file,
-            local_path=db_file,
+            file_path=db_file,
         )
         return bool(ok)
     except Exception as e:
@@ -55,7 +55,7 @@ def upload_db_to_drive(service, db_file: str, folder_id: str) -> bool:
         ok = upload_file_to_drive_stable(
             service=service,
             folder_id=folder_id,
-            local_path=db_file,
+            file_path=db_file,
             file_name=db_file,
         )
         return bool(ok)
