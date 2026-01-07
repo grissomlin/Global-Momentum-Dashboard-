@@ -34,67 +34,42 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pandas numpy google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dotenv
 
-      # 🚀 DB cache（all 模式也能用；會把 cache 裡已有的 *.db restore 下來）
       - name: 💾 Restore DB Cache
         uses: actions/cache@v3
         with:
           path: "*.db"
+          # all 模式會共用同一份 cache key；單市場則用 market prefix
           key: ${{ github.event.inputs.market }}-db-v3-${{ github.run_id }}
           restore-keys: |
             ${{ github.event.inputs.market }}-db-v3-
-            tw-db-v3-
-            us-db-v3-
-            cn-db-v3-
-            hk-db-v3-
-            jp-db-v3-
-            kr-db-v3-
 
       - name: 🧪 Run Processing & Sync to Cloud
         shell: bash
         run: |
           set -euo pipefail
-
-          MARKET="${{ github.event.inputs.market }}"
-
-          if [ "$MARKET" = "all" ]; then
-            MARKETS=("tw" "us" "cn" "hk" "jp" "kr")
-            echo "🚀 Running ALL markets: ${MARKETS[*]}"
-            for m in "${MARKETS[@]}"; do
-              echo "=============================="
-              echo "🧪 Start market: $m"
-              python -u only_feature.py "$m"
-              echo "✅ Done market: $m"
-            done
+          M="${{ github.event.inputs.market }}"
+          if [ "$M" = "all" ]; then
+            echo "🧪 Running all markets: tw/us/cn/hk/jp/kr"
+            python -u only_feature.py all
           else
-            echo "🧪 Running single market: $MARKET"
-            python -u only_feature.py "$MARKET"
+            echo "🧪 Running single market: $M"
+            python -u only_feature.py "$M"
           fi
 
       - name: 📢 Trigger Alpha Data Lab Sync
         if: success()
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
-        shell: bash
         run: |
-          set -euo pipefail
-
-          MARKET="${{ github.event.inputs.market }}"
-
-          if [ "$MARKET" = "all" ]; then
-            MARKETS=("tw" "us" "cn" "hk" "jp" "kr")
-            for m in "${MARKETS[@]}"; do
-              DB_NAME="${m}_stock_warehouse"
-              echo "🚀 通知 Alpha Data Lab: ${DB_NAME}"
-              curl -sS -X POST https://api.github.com/repos/grissomlin/Alpha-Data-Cleaning-Lab/dispatches \
-                -H "Accept: application/vnd.github.v3+json" \
-                -H "Authorization: bearer $GH_PAT" \
-                -d "{\"event_type\": \"warehouse_sync_complete\", \"client_payload\": {\"market_db\": \"$DB_NAME\"}}"
-            done
-          else
-            DB_NAME="${MARKET}_stock_warehouse"
-            echo "🚀 通知 Alpha Data Lab: ${DB_NAME}"
-            curl -sS -X POST https://api.github.com/repos/grissomlin/Alpha-Data-Cleaning-Lab/dispatches \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Authorization: bearer $GH_PAT" \
-              -d "{\"event_type\": \"warehouse_sync_complete\", \"client_payload\": {\"market_db\": \"$DB_NAME\"}}"
+          M="${{ github.event.inputs.market }}"
+          if [ "$M" = "all" ]; then
+            echo "⏭️ all 模式：略過單一 DB 的 repo dispatch（你也可以改成逐市場 dispatch）"
+            exit 0
           fi
+
+          DB_NAME="${M}_stock_warehouse"
+          echo "🚀 市場 ${M} 加工完成，通知 Alpha Data Lab..."
+          curl -X POST https://api.github.com/repos/grissomlin/Alpha-Data-Cleaning-Lab/dispatches \
+          -H "Accept: application/vnd.github.v3+json" \
+          -H "Authorization: bearer $GH_PAT" \
+          -d "{\"event_type\": \"warehouse_sync_complete\", \"client_payload\": {\"market_db\": \"$DB_NAME\"}}"
