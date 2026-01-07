@@ -16,12 +16,15 @@ kbar_contribution.py  (精準切段版｜都來｜不刪舊功能，只加)
     * ONE_WEEK_BURST  : top1_week_share_net >= 0.5
     * ONE_MONTH_BURST : top1_month_share_net >= 0.5
 
-本次加強（你要的）：
-- 週K/月K：period 內最大回撤（max_dd_log）
-- 週K/月K：period 內波動率（vol_dlogret_std：週內/月內 daily d_logret 的 std，不年化）
-- 週K/月K：「幅度變化率」（abs_ret_change_rate：abs(本期報酬%) 相對 abs(上期報酬%) 的變化率）
-- 也把「最強週/最強月」的上述指標帶出（寫文章最好用）
-- peak 前 top1 week（net 最大）也帶出 + 漲停數（你點名的）
+本次新增（你要的）：
+- 周K/月K 回撤（period 內 close 的 max drawdown log）
+- 周K/月K 波動率（該年週/月 logret 的 std）
+- 上週 vs 本週（最後兩週）漲跌幅「幅度變化率」
+- denom_year
+- top_week_id / top_week_logret_net / top_week_is_limitup_dense
+- top_week_id_net_to_peak（peak 前 top1 week）
+- limitup_count_in_top1week_to_peak
+- 月K對應欄位：top_month_id / ... / to_peak / limitup_count_in_top1month_to_peak
 """
 
 import sys
@@ -31,7 +34,6 @@ import pandas as pd
 from typing import Optional, Dict
 
 SQLITE_TIMEOUT = 120
-
 EPS = 1e-12
 
 
@@ -130,106 +132,10 @@ def _max_drawdown_log_from_close(close: pd.Series) -> float:
     return float(np.min(dd))
 
 
-def _logret_to_pct(logret: float) -> float:
-    """logret -> pct return"""
+def _logret_to_ret_pct(logret: float) -> float:
     if not np.isfinite(logret):
-        return 0.0
-    return float((np.exp(logret) - 1.0) * 100.0)
-
-
-def _period_features(
-    daily: pd.DataFrame,
-    periods: pd.DataFrame,
-    *,
-    id_col: str,
-    cutoff_date: Optional[pd.Timestamp] = None,
-) -> pd.DataFrame:
-    """
-    對每個 period 計算：
-      - net_logret: sum(d_logret)
-      - ret_pct / abs_ret_pct
-      - abs_ret_change_rate: abs_ret_pct 對上一期 abs_ret_pct 的變化率
-      - max_dd_log: period 內 close 的最大回撤（log）
-      - vol_dlogret_std: period 內 d_logret 的 std（不年化）
-      - limitup_count / n_days（方便算密度）
-
-    cutoff_date 用於 peak 前切段：
-      - period_end 會被截到 cutoff
-      - 若 period_start > cutoff，視為 inactive（該期 features=0）
-    """
-    if daily.empty or periods.empty:
-        return pd.DataFrame()
-
-    d = daily.copy()
-    d["date"] = pd.to_datetime(d["date"], errors="coerce")
-    d = d.dropna(subset=["date"]).sort_values("date")
-
-    p = periods.copy()
-    p["period_start"] = pd.to_datetime(p["period_start"], errors="coerce")
-    p["period_end"] = pd.to_datetime(p["period_end"], errors="coerce")
-    p = p.dropna(subset=["period_start", "period_end"]).sort_values("period_end")
-
-    rows = []
-    prev_abs = None
-
-    for _, r in p.iterrows():
-        pid = r[id_col]
-        ps = r["period_start"]
-        pe = r["period_end"]
-
-        active = True
-        pe_eff = pe
-        if cutoff_date is not None and pd.notna(cutoff_date):
-            if ps > cutoff_date:
-                active = False
-            pe_eff = min(pe, cutoff_date)
-
-        mask = (d["date"] >= ps) & (d["date"] <= pe_eff)
-        dd = d.loc[mask].copy()
-
-        if (not active) or dd.empty:
-            net_logret = 0.0
-            ret_pct = 0.0
-            abs_ret = 0.0
-            max_dd_log = 0.0
-            vol_std = 0.0
-            lu_cnt = 0
-            n_days = 0
-        else:
-            net_logret = float(dd["d_logret"].sum())
-            ret_pct = _logret_to_pct(net_logret)
-            abs_ret = float(abs(ret_pct))
-            max_dd_log = _max_drawdown_log_from_close(dd["close"])
-            vol_std = float(pd.to_numeric(dd["d_logret"], errors="coerce").std(ddof=0) or 0.0)
-            lu_cnt = int((dd["is_limit_up"] == 1).sum())
-            n_days = int(len(dd))
-
-        if prev_abs is None:
-            abs_chg_rate = 0.0
-        else:
-            abs_chg_rate = float((abs_ret - prev_abs) / max(prev_abs, EPS))
-
-        if active:
-            prev_abs = abs_ret
-
-        rows.append(
-            {
-                id_col: pid,
-                "period_start": ps,
-                "period_end": pe,
-                "active_to_cutoff": int(active),
-                "net_logret": net_logret,
-                "ret_pct": ret_pct,
-                "abs_ret_pct": abs_ret,
-                "abs_ret_change_rate": abs_chg_rate,
-                "max_dd_log": max_dd_log,
-                "vol_dlogret_std": vol_std,
-                "limitup_count": lu_cnt,
-                "n_days": n_days,
-            }
-        )
-
-    return pd.DataFrame(rows)
+        return np.nan
+    return float((np.expm1(logret)) * 100.0)
 
 
 # -----------------------------------------------------------------------------
@@ -272,6 +178,84 @@ def _align_peak_trade_date(daily_dates: pd.Series, peak_date: pd.Timestamp) -> O
     if dd2.empty:
         return None
     return pd.Timestamp(dd2.iloc[-1])
+
+
+# -----------------------------------------------------------------------------
+# NEW: build per-period stats (week/month) from daily + periods
+# -----------------------------------------------------------------------------
+def _build_period_stats(
+    daily: pd.DataFrame,
+    periods: pd.DataFrame,
+    *,
+    id_col: str,
+    cutoff_date: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """
+    回傳每個 period 的：
+    - id_col (week_id/month_id)
+    - period_start/period_end
+    - logret_sum (依 d_logret 加總；若 cutoff_date，會截到 cutoff_date)
+    - ret_pct
+    - max_drawdown_log (period 內 close 的 max drawdown log)
+    - limitup_count_dense (period 內 is_limit_up=1 數量；若 cutoff_date，會截到 cutoff_date)
+    """
+    if daily.empty or periods.empty:
+        return pd.DataFrame(columns=[id_col, "period_start", "period_end", "logret_sum", "ret_pct",
+                                     "max_drawdown_log", "limitup_count_dense"])
+
+    d = daily[["date", "close", "d_logret", "is_limit_up"]].copy()
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date"]).sort_values("date")
+
+    if cutoff_date is not None and pd.notna(cutoff_date):
+        d = d[d["date"] <= cutoff_date]
+
+    out_rows = []
+    for _, p in periods.iterrows():
+        pid = p.get(id_col, None)
+        ps = p.get("period_start", None)
+        pe = p.get("period_end", None)
+        if pd.isna(ps) or pd.isna(pe):
+            out_rows.append(
+                {id_col: pid, "period_start": ps, "period_end": pe,
+                 "logret_sum": 0.0, "ret_pct": 0.0, "max_drawdown_log": 0.0, "limitup_count_dense": 0}
+            )
+            continue
+
+        mask = (d["date"] >= ps) & (d["date"] <= pe)
+        seg = d.loc[mask].copy()
+        if seg.empty:
+            out_rows.append(
+                {id_col: pid, "period_start": ps, "period_end": pe,
+                 "logret_sum": 0.0, "ret_pct": 0.0, "max_drawdown_log": 0.0, "limitup_count_dense": 0}
+            )
+            continue
+
+        logret_sum = float(np.nansum(seg["d_logret"].values.astype(float)))
+        out_rows.append(
+            {
+                id_col: pid,
+                "period_start": ps,
+                "period_end": pe,
+                "logret_sum": logret_sum,
+                "ret_pct": _logret_to_ret_pct(logret_sum),
+                "max_drawdown_log": _max_drawdown_log_from_close(seg["close"]),
+                "limitup_count_dense": int((pd.to_numeric(seg["is_limit_up"], errors="coerce").fillna(0).astype(int) == 1).sum()),
+            }
+        )
+
+    return pd.DataFrame(out_rows)
+
+
+def _last_two_abs_change_rate(a: float, b: float) -> float:
+    """
+    你要的「上期 vs 本期 漲跌幅幅度變化率」：
+    (|b| - |a|) / (|a| + eps)
+    """
+    if not np.isfinite(a) or not np.isfinite(b):
+        return 0.0
+    denom = abs(a) + EPS
+    return float((abs(b) - abs(a)) / denom)
 
 
 # -----------------------------------------------------------------------------
@@ -362,7 +346,7 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
         sa["year"] = sa["date"].dt.year.astype(int)
         sa["is_limit_up"] = pd.to_numeric(sa["is_limit_up"], errors="coerce").fillna(0).astype(int)
 
-        # 逐日 logret
+        # 逐日 logret：
         sa["d_logret"] = 0.0
         mask_cp = (sa["close"].astype(float) > 0) & (sa["prev_close"].astype(float) > 0)
         sa.loc[mask_cp, "d_logret"] = np.log(
@@ -404,7 +388,7 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             peak_logret = _safe_log_ratio(peak_close, year_open) if np.isfinite(peak_close) else 0.0
             denom_peak = peak_logret if peak_logret > 0 else 0.0
 
-            # 從 peak 到年末回撤（log）
+            # 從 peak 到年末回撤
             peak_to_year_end_dd_log = 0.0
             if peak_trade_date is not None and np.isfinite(peak_close) and peak_close > 0:
                 year_end_close = float(d.iloc[-1]["close"]) if np.isfinite(d.iloc[-1]["close"]) else np.nan
@@ -414,86 +398,55 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             wps = wk[(wk["symbol"] == sym) & (wk["year"] == yr)].sort_values("period_end")
             mps = mk[(mk["symbol"] == sym) & (mk["year"] == yr)].sort_values("period_end")
 
-            # 精準切段：日K切週/月（logret array，保持你原本算法）
+            # 精準切段：日K切週/月（原本 array）
             w_logrets = _sum_logret_by_period(daily=d, periods=wps, cutoff_date=None)
             m_logrets = _sum_logret_by_period(daily=d, periods=mps, cutoff_date=None)
 
             worst_week_logret = float(np.nanmin(w_logrets)) if w_logrets.size > 0 else 0.0
             worst_month_logret = float(np.nanmin(m_logrets)) if m_logrets.size > 0 else 0.0
 
-            # ✅ 週/月 period 內：回撤 / 波動率 / 幅度變化率（abs週報酬變化）
-            wfeat = _period_features(d, wps, id_col="week_id", cutoff_date=None)
-            mfeat = _period_features(d, mps, id_col="month_id", cutoff_date=None)
+            # ========== NEW: 週/月 period stats（含回撤、limitup 密度） ==========
+            w_stats = _build_period_stats(daily=d, periods=wps, id_col="week_id", cutoff_date=None)
+            m_stats = _build_period_stats(daily=d, periods=mps, id_col="month_id", cutoff_date=None)
 
-            # 取「週/月」的平均特徵（全年度）
-            avg_week_max_dd_log = float(wfeat["max_dd_log"].mean()) if not wfeat.empty else 0.0
-            avg_week_vol_dlogret_std = float(wfeat["vol_dlogret_std"].mean()) if not wfeat.empty else 0.0
-            avg_week_abs_ret_change_rate = float(wfeat["abs_ret_change_rate"].mean()) if not wfeat.empty else 0.0
+            # 週/月 波動率（logret std）
+            week_vol_logret_std = float(np.nanstd(w_stats["logret_sum"].values.astype(float))) if len(w_stats) > 0 else 0.0
+            month_vol_logret_std = float(np.nanstd(m_stats["logret_sum"].values.astype(float))) if len(m_stats) > 0 else 0.0
 
-            avg_month_max_dd_log = float(mfeat["max_dd_log"].mean()) if not mfeat.empty else 0.0
-            avg_month_vol_dlogret_std = float(mfeat["vol_dlogret_std"].mean()) if not mfeat.empty else 0.0
-            avg_month_abs_ret_change_rate = float(mfeat["abs_ret_change_rate"].mean()) if not mfeat.empty else 0.0
+            # 上週 vs 本週（最後兩週）幅度變化率（用 ret_pct）
+            last_week_ret_pct = float(w_stats["ret_pct"].iloc[-1]) if len(w_stats) >= 1 else np.nan
+            prev_week_ret_pct = float(w_stats["ret_pct"].iloc[-2]) if len(w_stats) >= 2 else np.nan
+            week_abs_ret_change_rate = _last_two_abs_change_rate(prev_week_ret_pct, last_week_ret_pct) if len(w_stats) >= 2 else 0.0
 
-            # 取「最強週 / 最強月」（net_logret 最大）
-            top_week_id_net = None
+            # 上月 vs 本月（最後兩月）
+            last_month_ret_pct = float(m_stats["ret_pct"].iloc[-1]) if len(m_stats) >= 1 else np.nan
+            prev_month_ret_pct = float(m_stats["ret_pct"].iloc[-2]) if len(m_stats) >= 2 else np.nan
+            month_abs_ret_change_rate = _last_two_abs_change_rate(prev_month_ret_pct, last_month_ret_pct) if len(m_stats) >= 2 else 0.0
+
+            # top1 week/month（全年 net 最大 logret）
+            top_week_id = None
             top_week_logret_net = 0.0
-            top_week_max_dd_log = 0.0
-            top_week_vol_dlogret_std = 0.0
-            top_week_abs_ret_change_rate = 0.0
-            top_week_is_limitup_dense = 0.0  # 漲停密度 = 漲停天數/該週交易日數
+            top_week_is_limitup_dense = 0
+            top_week_max_drawdown_log = 0.0
 
-            if not wfeat.empty:
-                ww = wfeat.sort_values("net_logret", ascending=False).iloc[0]
-                top_week_id_net = int(ww["week_id"])
-                top_week_logret_net = float(ww["net_logret"])
-                top_week_max_dd_log = float(ww["max_dd_log"])
-                top_week_vol_dlogret_std = float(ww["vol_dlogret_std"])
-                top_week_abs_ret_change_rate = float(ww["abs_ret_change_rate"])
-                n_days = int(ww["n_days"]) if np.isfinite(ww["n_days"]) else 0
-                lu_cnt = int(ww["limitup_count"]) if np.isfinite(ww["limitup_count"]) else 0
-                top_week_is_limitup_dense = float(lu_cnt / max(n_days, 1))
+            if len(w_stats) > 0:
+                idx = int(np.nanargmax(w_stats["logret_sum"].values.astype(float)))
+                top_week_id = w_stats["week_id"].iloc[idx]
+                top_week_logret_net = float(w_stats["logret_sum"].iloc[idx])
+                top_week_is_limitup_dense = int(w_stats["limitup_count_dense"].iloc[idx])
+                top_week_max_drawdown_log = float(w_stats["max_drawdown_log"].iloc[idx])
 
-            top_month_id_net = None
+            top_month_id = None
             top_month_logret_net = 0.0
-            top_month_max_dd_log = 0.0
-            top_month_vol_dlogret_std = 0.0
-            top_month_abs_ret_change_rate = 0.0
-            top_month_is_limitup_dense = 0.0
+            top_month_is_limitup_dense = 0
+            top_month_max_drawdown_log = 0.0
 
-            if not mfeat.empty:
-                mm = mfeat.sort_values("net_logret", ascending=False).iloc[0]
-                top_month_id_net = int(mm["month_id"])
-                top_month_logret_net = float(mm["net_logret"])
-                top_month_max_dd_log = float(mm["max_dd_log"])
-                top_month_vol_dlogret_std = float(mm["vol_dlogret_std"])
-                top_month_abs_ret_change_rate = float(mm["abs_ret_change_rate"])
-                n_days = int(mm["n_days"]) if np.isfinite(mm["n_days"]) else 0
-                lu_cnt = int(mm["limitup_count"]) if np.isfinite(mm["limitup_count"]) else 0
-                top_month_is_limitup_dense = float(lu_cnt / max(n_days, 1))
-
-            # ✅ peak 前 top1 週（net 最大）+ 漲停數
-            top_week_id_net_to_peak = None
-            top_week_logret_net_to_peak = 0.0
-            top_week_max_dd_log_to_peak = 0.0
-            top_week_vol_dlogret_std_to_peak = 0.0
-            top_week_abs_ret_change_rate_to_peak = 0.0
-            limitup_count_in_top1week_to_peak = 0
-            top_week_is_limitup_dense_to_peak = 0.0
-
-            if peak_trade_date is not None and not wps.empty:
-                wfeat_peak = _period_features(d, wps, id_col="week_id", cutoff_date=peak_trade_date)
-                wfeat_peak = wfeat_peak[wfeat_peak["active_to_cutoff"] == 1].copy()
-                if not wfeat_peak.empty:
-                    ww2 = wfeat_peak.sort_values("net_logret", ascending=False).iloc[0]
-                    top_week_id_net_to_peak = int(ww2["week_id"])
-                    top_week_logret_net_to_peak = float(ww2["net_logret"])
-                    top_week_max_dd_log_to_peak = float(ww2["max_dd_log"])
-                    top_week_vol_dlogret_std_to_peak = float(ww2["vol_dlogret_std"])
-                    top_week_abs_ret_change_rate_to_peak = float(ww2["abs_ret_change_rate"])
-                    n_days2 = int(ww2["n_days"]) if np.isfinite(ww2["n_days"]) else 0
-                    lu_cnt2 = int(ww2["limitup_count"]) if np.isfinite(ww2["limitup_count"]) else 0
-                    limitup_count_in_top1week_to_peak = lu_cnt2
-                    top_week_is_limitup_dense_to_peak = float(lu_cnt2 / max(n_days2, 1))
+            if len(m_stats) > 0:
+                idxm = int(np.nanargmax(m_stats["logret_sum"].values.astype(float)))
+                top_month_id = m_stats["month_id"].iloc[idxm]
+                top_month_logret_net = float(m_stats["logret_sum"].iloc[idxm])
+                top_month_is_limitup_dense = int(m_stats["limitup_count_dense"].iloc[idxm])
+                top_month_max_drawdown_log = float(m_stats["max_drawdown_log"].iloc[idxm])
 
             # 集中度（POS/NET）
             top1_week_share_pos = _topk_share_pos(w_logrets, denom_year, 1)
@@ -523,7 +476,7 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             share_year_to_peak = float(logret_to_peak / denom_year) if denom_year > 0 else 0.0
             share_peak_to_peak = float(logret_to_peak / denom_peak) if denom_peak > 0 else 0.0
 
-            # peak 前：週/月切段到 peak（維持你原本算法）
+            # peak 前：週/月切段到 peak（array）
             w_logrets_to_peak = _sum_logret_by_period(daily=d, periods=wps, cutoff_date=peak_trade_date)
             m_logrets_to_peak = _sum_logret_by_period(daily=d, periods=mps, cutoff_date=peak_trade_date)
 
@@ -548,10 +501,44 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             limitup_log_share_to_peak_vs_year = float(limitup_log_sum_to_peak / denom_year) if denom_year > 0 else 0.0
             limitup_log_share_to_peak_vs_peak = float(limitup_log_sum_to_peak / denom_peak) if denom_peak > 0 else 0.0
 
+            # ========== NEW: peak 前 top1 week/month ==========
+            top_week_id_net_to_peak = None
+            limitup_count_in_top1week_to_peak = 0
+
+            top_month_id_net_to_peak = None
+            limitup_count_in_top1month_to_peak = 0
+
+            if peak_trade_date is not None and len(wps) > 0:
+                # 依「截到 peak」的 period logret 選 top1
+                if w_logrets_to_peak.size == len(wps):
+                    idxp = int(np.nanargmax(w_logrets_to_peak.astype(float)))
+                    top_week_id_net_to_peak = wps.iloc[idxp]["week_id"]
+
+                    # 計算該週內（但只到 peak）漲停數
+                    ps = wps.iloc[idxp]["period_start"]
+                    pe = wps.iloc[idxp]["period_end"]
+                    pe2 = min(pd.Timestamp(pe), pd.Timestamp(peak_trade_date))
+                    seg = d[(d["date"] >= ps) & (d["date"] <= pe2)]
+                    limitup_count_in_top1week_to_peak = int((seg["is_limit_up"] == 1).sum())
+
+            if peak_trade_date is not None and len(mps) > 0:
+                if m_logrets_to_peak.size == len(mps):
+                    idxmp = int(np.nanargmax(m_logrets_to_peak.astype(float)))
+                    top_month_id_net_to_peak = mps.iloc[idxmp]["month_id"]
+
+                    ps = mps.iloc[idxmp]["period_start"]
+                    pe = mps.iloc[idxmp]["period_end"]
+                    pe2 = min(pd.Timestamp(pe), pd.Timestamp(peak_trade_date))
+                    seg = d[(d["date"] >= ps) & (d["date"] <= pe2)]
+                    limitup_count_in_top1month_to_peak = int((seg["is_limit_up"] == 1).sum())
+
             rows.append(
                 {
                     "symbol": sym,
                     "year": yr,
+
+                    # ✅ denom
+                    "denom_year": denom_year,
 
                     # 年K
                     "y_open": year_open,
@@ -580,6 +567,37 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
                     "peak_to_year_end_drawdown_log": peak_to_year_end_dd_log,
                     "worst_week_logret": worst_week_logret,
                     "worst_month_logret": worst_month_logret,
+
+                    # ✅ NEW: 周/月波動率（logret std）
+                    "week_vol_logret_std": week_vol_logret_std,
+                    "month_vol_logret_std": month_vol_logret_std,
+
+                    # ✅ NEW: 最後兩週/兩月幅度變化率
+                    "prev_week_ret_pct": prev_week_ret_pct if np.isfinite(prev_week_ret_pct) else np.nan,
+                    "last_week_ret_pct": last_week_ret_pct if np.isfinite(last_week_ret_pct) else np.nan,
+                    "week_abs_ret_change_rate": week_abs_ret_change_rate,
+
+                    "prev_month_ret_pct": prev_month_ret_pct if np.isfinite(prev_month_ret_pct) else np.nan,
+                    "last_month_ret_pct": last_month_ret_pct if np.isfinite(last_month_ret_pct) else np.nan,
+                    "month_abs_ret_change_rate": month_abs_ret_change_rate,
+
+                    # ✅ NEW: top week/month info（全年）
+                    "top_week_id": top_week_id,
+                    "top_week_logret_net": top_week_logret_net,
+                    "top_week_is_limitup_dense": top_week_is_limitup_dense,
+                    "top_week_max_drawdown_log": top_week_max_drawdown_log,
+
+                    "top_month_id": top_month_id,
+                    "top_month_logret_net": top_month_logret_net,
+                    "top_month_is_limitup_dense": top_month_is_limitup_dense,
+                    "top_month_max_drawdown_log": top_month_max_drawdown_log,
+
+                    # ✅ NEW: peak 前 top1 week/month
+                    "top_week_id_net_to_peak": top_week_id_net_to_peak,
+                    "limitup_count_in_top1week_to_peak": int(limitup_count_in_top1week_to_peak),
+
+                    "top_month_id_net_to_peak": top_month_id_net_to_peak,
+                    "limitup_count_in_top1month_to_peak": int(limitup_count_in_top1month_to_peak),
 
                     # 週/月集中度（全年）
                     "top1_week_share_pos": top1_week_share_pos,
@@ -618,39 +636,6 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
                     "limitup_log_sum_to_peak": limitup_log_sum_to_peak,
                     "limitup_log_share_to_peak_vs_year": limitup_log_share_to_peak_vs_year,
                     "limitup_log_share_to_peak_vs_peak": limitup_log_share_to_peak_vs_peak,
-
-                    # ✅ 週K/月K（年度平均）回撤/波動/幅度變化率
-                    "avg_week_max_dd_log": avg_week_max_dd_log,
-                    "avg_week_vol_dlogret_std": avg_week_vol_dlogret_std,
-                    "avg_week_abs_ret_change_rate": avg_week_abs_ret_change_rate,
-
-                    "avg_month_max_dd_log": avg_month_max_dd_log,
-                    "avg_month_vol_dlogret_std": avg_month_vol_dlogret_std,
-                    "avg_month_abs_ret_change_rate": avg_month_abs_ret_change_rate,
-
-                    # ✅ 最強週 / 最強月（net 最大）回撤/波動/幅度變化率 + 漲停密度
-                    "top_week_id_net": top_week_id_net,
-                    "top_week_logret_net": top_week_logret_net,
-                    "top_week_max_dd_log": top_week_max_dd_log,
-                    "top_week_vol_dlogret_std": top_week_vol_dlogret_std,
-                    "top_week_abs_ret_change_rate": top_week_abs_ret_change_rate,
-                    "top_week_is_limitup_dense": top_week_is_limitup_dense,
-
-                    "top_month_id_net": top_month_id_net,
-                    "top_month_logret_net": top_month_logret_net,
-                    "top_month_max_dd_log": top_month_max_dd_log,
-                    "top_month_vol_dlogret_std": top_month_vol_dlogret_std,
-                    "top_month_abs_ret_change_rate": top_month_abs_ret_change_rate,
-                    "top_month_is_limitup_dense": top_month_is_limitup_dense,
-
-                    # ✅ peak 前 top1 週（net 最大）+ 漲停數（你點名的）
-                    "top_week_id_net_to_peak": top_week_id_net_to_peak,
-                    "top_week_logret_net_to_peak": top_week_logret_net_to_peak,
-                    "top_week_max_dd_log_to_peak": top_week_max_dd_log_to_peak,
-                    "top_week_vol_dlogret_std_to_peak": top_week_vol_dlogret_std_to_peak,
-                    "top_week_abs_ret_change_rate_to_peak": top_week_abs_ret_change_rate_to_peak,
-                    "limitup_count_in_top1week_to_peak": limitup_count_in_top1week_to_peak,
-                    "top_week_is_limitup_dense_to_peak": top_week_is_limitup_dense_to_peak,
                 }
             )
 
@@ -701,14 +686,9 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
                     "avg_year_max_drawdown_log": float(df["year_max_drawdown_log"].mean()),
                     "avg_peak_to_year_end_drawdown_log": float(df["peak_to_year_end_drawdown_log"].mean()),
 
-                    # ✅ 週/月平均（回撤/波動/幅度變化率）
-                    "avg_week_max_dd_log": float(df["avg_week_max_dd_log"].mean()) if "avg_week_max_dd_log" in df.columns else 0.0,
-                    "avg_week_vol_dlogret_std": float(df["avg_week_vol_dlogret_std"].mean()) if "avg_week_vol_dlogret_std" in df.columns else 0.0,
-                    "avg_week_abs_ret_change_rate": float(df["avg_week_abs_ret_change_rate"].mean()) if "avg_week_abs_ret_change_rate" in df.columns else 0.0,
-
-                    "avg_month_max_dd_log": float(df["avg_month_max_dd_log"].mean()) if "avg_month_max_dd_log" in df.columns else 0.0,
-                    "avg_month_vol_dlogret_std": float(df["avg_month_vol_dlogret_std"].mean()) if "avg_month_vol_dlogret_std" in df.columns else 0.0,
-                    "avg_month_abs_ret_change_rate": float(df["avg_month_abs_ret_change_rate"].mean()) if "avg_month_abs_ret_change_rate" in df.columns else 0.0,
+                    # ✅ NEW: 週/月波動率均值
+                    "avg_week_vol_logret_std": float(df["week_vol_logret_std"].mean()) if "week_vol_logret_std" in df.columns else 0.0,
+                    "avg_month_vol_logret_std": float(df["month_vol_logret_std"].mean()) if "month_vol_logret_std" in df.columns else 0.0,
 
                     # 直覺門檻
                     "pct_top1_week_net_ge_0_4": float((df["top1_week_share_net"] >= 0.4).mean() * 100),
@@ -729,11 +709,10 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
 
         conn.commit()
 
-        print("\n✅ kbar_contribution（精準切段｜都來）完成：")
+        print("\n✅ kbar_contribution（精準切段｜都來｜加周月波動/回撤/peak前top1）完成：")
         print(f"📌 year_contribution rows: {len(out):,}")
         print(f"📌 year_contribution_bins rows: {len(bins):,}")
-        print("📌 burst labels：burst_style_week / burst_style_month 已加入")
-        print("📌 NEW：週/月回撤(max_dd_log)、波動(vol_dlogret_std)、幅度變化率(abs_ret_change_rate) 已加入（含 top1 週/月 與 peak 前 top1 週）")
+        print("📌 新增：week/month vol, top_week/month info, peak 前 top1 week/month + 該期漲停數")
 
         return {"year_rows": int(len(out)), "bin_rows": int(len(bins))}
 
