@@ -4,17 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       market:
-        description: '選擇要加工的市場 (tw / us / cn / hk / jp / kr)'
+        description: '選擇要加工的市場 (tw / us / cn / hk / jp / kr / all)'
         required: true
         default: 'tw'
         type: choice
-        options: [tw, us, cn, hk, jp, kr]
+        options: [tw, us, cn, hk, jp, kr, all]
 
 jobs:
   process:
     runs-on: ubuntu-latest
-    
-    # 設定環境變數，讓 only_feature.py 內的 Google Drive 功能可以運作
+
     env:
       GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
@@ -32,36 +31,70 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          # 💡 使用 requirements.txt 安裝以解決 ModuleNotFoundError: No module named 'google'
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # 額外確保核心套件存在
           pip install pandas numpy google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dotenv
 
-      # 🚀 關鍵：從快取抓回舊的資料庫檔案
+      # 🚀 DB cache（all 模式也能用；會把 cache 裡已有的 *.db restore 下來）
       - name: 💾 Restore DB Cache
         uses: actions/cache@v3
         with:
           path: "*.db"
-          # 使用 v3 版本前綴，並加上 run_id 確保能匹配到最新的成功快取
           key: ${{ github.event.inputs.market }}-db-v3-${{ github.run_id }}
           restore-keys: |
             ${{ github.event.inputs.market }}-db-v3-
+            tw-db-v3-
+            us-db-v3-
+            cn-db-v3-
+            hk-db-v3-
+            jp-db-v3-
+            kr-db-v3-
 
       - name: 🧪 Run Processing & Sync to Cloud
+        shell: bash
         run: |
-          # 使用 -u 讓 Log 即時印出
-          # 執行 only_feature.py，該腳本應包含 process_market_data 與 upload_db_to_drive
-          python -u only_feature.py ${{ github.event.inputs.market }}
+          set -euo pipefail
 
-      # 📢 選配：如果加工成功，觸發另一個 Repo 的連動 (維持你原本 main.yml 的邏輯)
+          MARKET="${{ github.event.inputs.market }}"
+
+          if [ "$MARKET" = "all" ]; then
+            MARKETS=("tw" "us" "cn" "hk" "jp" "kr")
+            echo "🚀 Running ALL markets: ${MARKETS[*]}"
+            for m in "${MARKETS[@]}"; do
+              echo "=============================="
+              echo "🧪 Start market: $m"
+              python -u only_feature.py "$m"
+              echo "✅ Done market: $m"
+            done
+          else
+            echo "🧪 Running single market: $MARKET"
+            python -u only_feature.py "$MARKET"
+          fi
+
       - name: 📢 Trigger Alpha Data Lab Sync
         if: success()
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+        shell: bash
         run: |
-          DB_NAME="${{ github.event.inputs.market }}_stock_warehouse"
-          echo "🚀 市場 ${{ github.event.inputs.market }} 加工完成，通知 Alpha Data Lab..."
-          curl -X POST https://api.github.com/repos/grissomlin/Alpha-Data-Cleaning-Lab/dispatches \
-          -H "Accept: application/vnd.github.v3+json" \
-          -H "Authorization: bearer $GH_PAT" \
-          -d "{\"event_type\": \"warehouse_sync_complete\", \"client_payload\": {\"market_db\": \"$DB_NAME\"}}"
+          set -euo pipefail
+
+          MARKET="${{ github.event.inputs.market }}"
+
+          if [ "$MARKET" = "all" ]; then
+            MARKETS=("tw" "us" "cn" "hk" "jp" "kr")
+            for m in "${MARKETS[@]}"; do
+              DB_NAME="${m}_stock_warehouse"
+              echo "🚀 通知 Alpha Data Lab: ${DB_NAME}"
+              curl -sS -X POST https://api.github.com/repos/grissomlin/Alpha-Data-Cleaning-Lab/dispatches \
+                -H "Accept: application/vnd.github.v3+json" \
+                -H "Authorization: bearer $GH_PAT" \
+                -d "{\"event_type\": \"warehouse_sync_complete\", \"client_payload\": {\"market_db\": \"$DB_NAME\"}}"
+            done
+          else
+            DB_NAME="${MARKET}_stock_warehouse"
+            echo "🚀 通知 Alpha Data Lab: ${DB_NAME}"
+            curl -sS -X POST https://api.github.com/repos/grissomlin/Alpha-Data-Cleaning-Lab/dispatches \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: bearer $GH_PAT" \
+              -d "{\"event_type\": \"warehouse_sync_complete\", \"client_payload\": {\"market_db\": \"$DB_NAME\"}}"
+          fi
