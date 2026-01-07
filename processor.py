@@ -22,10 +22,11 @@ Feature Layer（寫回 stock_analysis）
 import sqlite3
 import pandas as pd
 import numpy as np
-from datetime import datetime
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+SQLITE_TIMEOUT = 120
 
 
 # =============================================================================
@@ -41,15 +42,14 @@ except Exception:
 
 # =============================================================================
 # 1) Fallback 規則（只有當 market_rules.py 不存在時才用）
-#    你做「精準版」時，應該讓 market_rules.py 存在，這段就不會用到。
 # =============================================================================
 def _fallback_get_rule(market: str, market_detail: str, symbol: str) -> dict:
     """
     回傳 dict：
-    - limit_kind: 'pct' / 'none' （fallback 不支援 JP 値幅制限）
+    - limit_kind: 'pct' / 'none'
     - limit_up_pct: float or None
     - threshold: float（強勢日門檻，給 peak_contribution 用）
-    - strength_bins: list of edges in % for pd.cut
+    - strength_edges: list of edges in % for pd.cut
     - strength_labels: labels for bins
     - max_strength: int
     """
@@ -57,24 +57,20 @@ def _fallback_get_rule(market: str, market_detail: str, symbol: str) -> dict:
     md = (market_detail or "").lower().strip()
     sym = (symbol or "").upper().strip()
 
+    edges = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, np.inf]
+    labels = [
+        "RANK_0_10", "RANK_10_20", "RANK_20_30", "RANK_30_40", "RANK_40_50",
+        "RANK_50_60", "RANK_60_70", "RANK_70_80", "RANK_80_90", "RANK_90_100", "RANK_100UP",
+    ]
+
     # --- TW ---
     if m in ["TW", "TSE", "GTSM"] or sym.endswith(".TW") or sym.endswith(".TWO"):
         if md == "emerging":
             # 興櫃：無漲跌幅限制（fallback：不做漲停判定）
-            edges = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, np.inf]
-            labels = [
-                "RANK_0_10", "RANK_10_20", "RANK_20_30", "RANK_30_40", "RANK_40_50",
-                "RANK_50_60", "RANK_60_70", "RANK_70_80", "RANK_80_90", "RANK_90_100", "RANK_100UP",
-            ]
             return dict(limit_kind="none", limit_up_pct=None, threshold=0.20,
                         strength_edges=edges, strength_labels=labels, max_strength=100)
         else:
             # 上市/上櫃：10% 漲停（fallback：不做 tick 對齊）
-            edges = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, np.inf]
-            labels = [
-                "RANK_0_10", "RANK_10_20", "RANK_20_30", "RANK_30_40", "RANK_40_50",
-                "RANK_50_60", "RANK_60_70", "RANK_70_80", "RANK_80_90", "RANK_90_100", "RANK_100UP",
-            ]
             return dict(limit_kind="pct", limit_up_pct=0.10, threshold=0.10,
                         strength_edges=edges, strength_labels=labels, max_strength=100)
 
@@ -82,39 +78,22 @@ def _fallback_get_rule(market: str, market_detail: str, symbol: str) -> dict:
     if m in ["SSE", "SZSE", "CN", "CHINA"] or sym.endswith(".SS") or sym.endswith(".SZ"):
         # 300/301/688 => 20%（創業板/科創板），其他 10%
         code = "".join([c for c in sym if c.isdigit()])
-        up = 0.10
-        if code.startswith(("300", "301", "688")):
-            up = 0.20
-        edges = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, np.inf]
-        labels = [
-            "RANK_0_10", "RANK_10_20", "RANK_20_30", "RANK_30_40", "RANK_40_50",
-            "RANK_50_60", "RANK_60_70", "RANK_70_80", "RANK_80_90", "RANK_90_100", "RANK_100UP",
-        ]
+        up = 0.20 if code.startswith(("300", "301", "688")) else 0.10
         return dict(limit_kind="pct", limit_up_pct=up, threshold=up,
                     strength_edges=edges, strength_labels=labels, max_strength=100)
 
     # --- JP (fallback：當作無漲跌幅限制，不算漲停) ---
     if m in ["JP", "TSE", "JPX"] or sym.endswith(".T"):
-        edges = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, np.inf]
-        labels = [
-            "RANK_0_10", "RANK_10_20", "RANK_20_30", "RANK_30_40", "RANK_40_50",
-            "RANK_50_60", "RANK_60_70", "RANK_70_80", "RANK_80_90", "RANK_90_100", "RANK_100UP",
-        ]
         return dict(limit_kind="none", limit_up_pct=None, threshold=0.10,
                     strength_edges=edges, strength_labels=labels, max_strength=100)
 
     # --- Default ---
-    edges = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, np.inf]
-    labels = [
-        "RANK_0_10", "RANK_10_20", "RANK_20_30", "RANK_30_40", "RANK_40_50",
-        "RANK_50_60", "RANK_60_70", "RANK_70_80", "RANK_80_90", "RANK_90_100", "RANK_100UP",
-    ]
     return dict(limit_kind="none", limit_up_pct=None, threshold=0.10,
                 strength_edges=edges, strength_labels=labels, max_strength=100)
 
 
 def _fallback_calc_limit_up_price(prev_close: pd.Series, limit_up_pct: float) -> pd.Series:
-    # fallback：不對齊 tick（TW/JP 精準版會在 market_rules 裡做）
+    # fallback：不對齊 tick
     return (prev_close * (1 + limit_up_pct)).round(2)
 
 
@@ -129,7 +108,6 @@ def _make_strength_bins(change_pct: pd.Series, edges, labels) -> pd.Series:
     """
     out = pd.cut(change_pct, bins=edges, labels=labels, right=False, include_lowest=True)
     out = out.astype("object")
-    # <=0 或 NaN
     out = np.where(change_pct <= 0, "NEGATIVE", out)
     out = np.where((change_pct > 0) & (change_pct < edges[1]), "POSITIVE", out)  # 0~10% 正值
     return pd.Series(out, index=change_pct.index)
@@ -146,10 +124,8 @@ def _strength_value_from_rank(rank: pd.Series) -> pd.Series:
             return 1
         if isinstance(x, str) and x.startswith("RANK_"):
             if x.endswith("UP"):
-                # RANK_100UP
                 digits = "".join([c for c in x if c.isdigit()])
                 return int(digits) if digits else 0
-            # RANK_10_20
             parts = x.replace("RANK_", "").split("_")
             try:
                 return int(parts[0])
@@ -193,10 +169,9 @@ def _compute_lu_type_article_style(
     5. LOW_VOL_LOCK  ：is_low_vol
     6. HIGH_VOL_LOCK ：is_high_vol
     7. OTHER
-    最後合併成五類：
+    合併成五類：
       FLOATING / GAP_UP / OTHER / HIGH_VOLUME_LOCK / NO_VOLUME_LOCK
     """
-    # 避免除以 0
     safe_prev = prev_close.replace(0, np.nan)
     safe_vol_ma5 = vol_ma5.replace(0, np.nan)
     safe_open = open_.replace(0, np.nan)
@@ -207,7 +182,6 @@ def _compute_lu_type_article_style(
     low_vol = vol_ratio <= 0.4
     floating = (~gap) & ((close / safe_open - 1) >= 0.05)
 
-    # 先產生細分類
     cat = pd.Series("OTHER", index=is_limit_up.index, dtype="object")
     cat = np.where(gap & low_vol, "GAP_UP_LOCK", cat)
     cat = np.where(gap & (~low_vol), "GAP_UP", cat)
@@ -216,14 +190,12 @@ def _compute_lu_type_article_style(
     cat = np.where((~gap) & (~floating) & low_vol, "LOW_VOL_LOCK", cat)
     cat = np.where((~gap) & (~floating) & high_vol, "HIGH_VOL_LOCK", cat)
 
-    # 合併成五大類（你要的）
     merged = pd.Series("OTHER", index=is_limit_up.index, dtype="object")
     merged = np.where(np.isin(cat, ["FLOAT", "FLOAT_HV"]), "FLOATING", merged)
     merged = np.where(np.isin(cat, ["GAP_UP", "GAP_UP_LOCK"]), "GAP_UP", merged)
     merged = np.where(cat == "HIGH_VOL_LOCK", "HIGH_VOLUME_LOCK", merged)
     merged = np.where(cat == "LOW_VOL_LOCK", "NO_VOLUME_LOCK", merged)
 
-    # 只在漲停日才保留類型，非漲停日設 None
     merged = np.where(is_limit_up == 1, merged, None)
     return pd.Series(merged, index=is_limit_up.index, dtype="object")
 
@@ -232,7 +204,7 @@ def _compute_lu_type_article_style(
 # 3) 主流程
 # =============================================================================
 def process_market_data(db_path: str):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT)
 
     # 1) 讀取數據並關聯 stock_info 取得市場與產業別
     query = """
@@ -247,21 +219,37 @@ def process_market_data(db_path: str):
         conn.close()
         return
 
-    # 日期清理
+    # 必要欄位保底（避免某些市場缺 low/high/volume）
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    if "market" not in df.columns:
+        df["market"] = ""
+    if "market_detail" not in df.columns:
+        df["market_detail"] = ""
+    if "sector" not in df.columns:
+        df["sector"] = None
+
+    # 型別清理
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"])
     df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
+
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
     processed_list = []
 
     for symbol, group in df.groupby("symbol", sort=False):
         group = group.copy().sort_values("date").reset_index(drop=True)
 
+        # 太短不做（避免指標噪聲很大）
         if len(group) < 40:
             continue
 
-        market = group["market"].iloc[0] if "market" in group.columns else ""
-        market_detail = group["market_detail"].iloc[0] if "market_detail" in group.columns else ""
+        market = str(group["market"].iloc[0]) if "market" in group.columns else ""
+        market_detail = str(group["market_detail"].iloc[0]) if "market_detail" in group.columns else ""
 
         # 取得市場規則（以 market_rules.py 為主）
         if HAS_MARKET_RULES and hasattr(market_rules, "get_rule"):
@@ -270,8 +258,8 @@ def process_market_data(db_path: str):
             rule = _fallback_get_rule(market, market_detail, symbol)
 
         # --- 基礎欄位 ---
-        group["daily_change"] = group["close"].pct_change()
         group["prev_close"] = group["close"].shift(1)
+        group["daily_change"] = group["close"].pct_change()
         group["avg_vol_20"] = group["volume"].rolling(window=20, min_periods=1).mean()
         group["vol_ma5"] = group["volume"].rolling(window=5, min_periods=1).mean()
         group["year"] = group["date"].dt.year
@@ -283,7 +271,6 @@ def process_market_data(db_path: str):
         edges = rule.get("strength_edges")
         labels = rule.get("strength_labels")
         if edges is None or labels is None:
-            # fallback 保底（仍用 0/10/20.../100/inf）
             edges = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, np.inf]
             labels = [
                 "RANK_0_10", "RANK_10_20", "RANK_20_30", "RANK_30_40", "RANK_40_50",
@@ -295,11 +282,11 @@ def process_market_data(db_path: str):
 
         # --- 漲停判定 is_limit_up ---
         group["is_limit_up"] = 0
-
         limit_kind = rule.get("limit_kind", "none")
         limit_up_pct = rule.get("limit_up_pct", None)
 
         # market_rules 精準版（TW tick / JP 値幅制限）
+        used_precise = False
         if HAS_MARKET_RULES and hasattr(market_rules, "calc_limit_up_price"):
             try:
                 limit_price = market_rules.calc_limit_up_price(
@@ -308,38 +295,37 @@ def process_market_data(db_path: str):
                     market_detail=market_detail,
                     symbol=symbol,
                 )
-                # 若回傳 None 表示不適用（例如無漲跌幅限制市場）
                 if limit_price is not None:
-                    # 容忍度：若 market_rules 有 tick_size，用 tick*0.5 當 buffer
                     if hasattr(market_rules, "tick_size"):
-                        tick = group["prev_close"].astype(float).apply(lambda x: market_rules.tick_size(x, market=market, symbol=symbol))
+                        tick = group["prev_close"].astype(float).apply(
+                            lambda x: market_rules.tick_size(float(x), market=market, symbol=symbol)
+                        )
                         buffer = tick.fillna(0) * 0.5
                     else:
                         buffer = 0.0
                     group["is_limit_up"] = (group["close"].astype(float) >= (limit_price.astype(float) - buffer)).astype(int)
+                    used_precise = True
             except Exception:
-                # fallback 走下面
-                pass
+                used_precise = False
 
-        # fallback：固定百分比
-        if group["is_limit_up"].sum() == 0 and limit_kind == "pct" and isinstance(limit_up_pct, (int, float)):
+        # fallback：固定百分比（僅在精準判定沒生效時）
+        if (not used_precise) and limit_kind == "pct" and isinstance(limit_up_pct, (int, float)):
             limit_price = _fallback_calc_limit_up_price(group["prev_close"].astype(float), float(limit_up_pct))
             group["is_limit_up"] = (group["close"].astype(float) >= limit_price * 0.999).astype(int)
 
-        # 其餘：無漲跌幅限制（processor 不做「把10%當漲停」的事件定義；那放 event_engine）
-        # 但若你想要在 feature layer 也有個「synthetic_limit_up」：可在 market_rules 提供 synthetic_limit_up_pct
+        # 其餘：無漲跌幅限制（processor 不把 10% 當事件漲停；事件在 event_engine）
         synth = rule.get("synthetic_limit_up_pct", None)
         if synth is not None and group["is_limit_up"].sum() == 0:
             group["is_limit_up"] = (group["daily_change"].astype(float) >= float(synth)).astype(int)
 
-        # --- 一字鎖（給之後事件/隔日沖用，先放在 stock_analysis） ---
+        # --- 一字鎖 ---
         group["is_one_tick_lock"] = (
             (group["open"] == group["close"]) &
             (group["high"] == group["low"]) &
             (group["high"] == group["close"])
         ).astype(int)
 
-        # --- LU 型態（用你文章那套規則，只在漲停日給類型） ---
+        # --- LU 型態（只在漲停日給類型） ---
         group["lu_type"] = _compute_lu_type_article_style(
             is_limit_up=group["is_limit_up"],
             open_=group["open"].astype(float),
@@ -354,21 +340,21 @@ def process_market_data(db_path: str):
         # --- 連板次數 ---
         group["consecutive_limits"] = _compute_consecutive_limits(group["is_limit_up"]).astype(int)
 
-        # --- 年度巔峰貢獻度（沿用你原本邏輯，但用 rule['threshold']） ---
+        # --- 年度巔峰貢獻度（用 rule['threshold']） ---
         threshold = float(rule.get("threshold", 0.10))
 
         def calc_peak_contribution(df_year: pd.DataFrame) -> pd.DataFrame:
             if df_year.empty:
                 df_year["peak_date"] = None
                 df_year["peak_high_ret"] = np.nan
-                df_year["strong_day_contribution"] = np.nan
+                df_year["strong_day_contribution"] = 0.0
                 return df_year
 
-            valid_high = df_year["high"].dropna()
+            valid_high = pd.to_numeric(df_year["high"], errors="coerce").dropna()
             if valid_high.empty:
                 df_year["peak_date"] = None
                 df_year["peak_high_ret"] = np.nan
-                df_year["strong_day_contribution"] = np.nan
+                df_year["strong_day_contribution"] = 0.0
                 return df_year
 
             peak_idx = valid_high.idxmax()
@@ -377,18 +363,25 @@ def process_market_data(db_path: str):
 
             year_open = df_year.iloc[0]["open"] if len(df_year) > 0 else np.nan
 
-            if pd.notna(peak_price) and pd.notna(year_open) and year_open > 0:
-                total_peak_log = np.log(float(peak_price) / float(year_open))
+            if pd.notna(peak_price) and pd.notna(year_open) and float(year_open) > 0:
+                total_peak_log = float(np.log(float(peak_price) / float(year_open)))
             else:
                 total_peak_log = 0.0
 
-            mask_before = (df_year["date"] <= peak_date) if peak_date is not None else pd.Series(False, index=df_year.index)
+            if peak_date is not None:
+                mask_before = (df_year["date"] <= peak_date)
+            else:
+                mask_before = pd.Series(False, index=df_year.index)
 
-            daily_logs = np.log(df_year["close"] / df_year["prev_close"])
-            strong_day_mask = (df_year["daily_change"] >= threshold) & mask_before
+            # logret：close/prev_close（避免 prev_close=0）
+            safe_prev = pd.to_numeric(df_year["prev_close"], errors="coerce").replace(0, np.nan)
+            safe_close = pd.to_numeric(df_year["close"], errors="coerce").replace(0, np.nan)
+            daily_logs = np.log(safe_close / safe_prev).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+            strong_day_mask = (pd.to_numeric(df_year["daily_change"], errors="coerce").fillna(0.0) >= threshold) & mask_before
 
             if strong_day_mask.any() and total_peak_log > 0:
-                strong_contribution = daily_logs[strong_day_mask].sum()
+                strong_contribution = float(daily_logs[strong_day_mask].sum())
                 strong_day_contribution = float(strong_contribution / total_peak_log * 100)
             else:
                 strong_day_contribution = 0.0
@@ -396,7 +389,7 @@ def process_market_data(db_path: str):
             df_year["peak_date"] = peak_date
             df_year["peak_high_ret"] = (
                 (float(peak_price) - float(year_open)) / float(year_open) * 100
-                if pd.notna(peak_price) and pd.notna(year_open) and year_open > 0
+                if pd.notna(peak_price) and pd.notna(year_open) and float(year_open) > 0
                 else np.nan
             )
             df_year["strong_day_contribution"] = strong_day_contribution
@@ -411,7 +404,7 @@ def process_market_data(db_path: str):
         if "year" not in group.columns:
             group["year"] = year_values
 
-        # --- 技術指標（保留你原本） ---
+        # --- 技術指標 ---
         group["ma20"] = group["close"].rolling(window=20, min_periods=1).mean()
         group["ma60"] = group["close"].rolling(window=60, min_periods=1).mean()
 
@@ -421,8 +414,10 @@ def process_market_data(db_path: str):
         group["macds"] = group["macd"].ewm(span=9, adjust=False).mean()
         group["macdh"] = group["macd"] - group["macds"]
 
+        # 年化波動率（20D）
         group["volatility_20"] = group["daily_change"].rolling(window=20, min_periods=1).std() * np.sqrt(252)
 
+        # RSI 14
         delta = group["close"].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=1).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=1).mean()
@@ -456,7 +451,7 @@ def process_market_data(db_path: str):
     if "peak_date" in df_final.columns:
         df_final["peak_date"] = pd.to_datetime(df_final["peak_date"], errors="coerce").dt.strftime("%Y-%m-%d")
 
-    # 重建 stock_analysis
+    # 重建 stock_analysis（✅ 這一步會讓 DB 真的「增加欄位」：因為 schema 會跟著 df_final 變）
     conn.execute("DROP TABLE IF EXISTS stock_analysis")
     df_final.to_sql("stock_analysis", conn, if_exists="replace", index=False)
 
@@ -471,6 +466,8 @@ def process_market_data(db_path: str):
     except Exception:
         pass
 
+    conn.commit()
+
     # 統計輸出
     total_symbols = df_final["symbol"].nunique()
     date_range = f"{df_final['date'].min()} ~ {df_final['date'].max()}"
@@ -479,7 +476,7 @@ def process_market_data(db_path: str):
     print(f"📌 股票數量: {total_symbols}")
     print(f"📌 期間: {date_range}")
     print(f"📌 總行數: {len(df_final):,}")
-    print("📌 新增/確認欄位包含：is_limit_up, is_one_tick_lock, lu_type(文章規則), consecutive_limits, strength_rank(10%~100%+分箱)")
+    print("📌 新增/確認欄位包含：is_limit_up, is_one_tick_lock, lu_type(文章規則), consecutive_limits, strength_rank, volatility_20")
 
     conn.close()
 
