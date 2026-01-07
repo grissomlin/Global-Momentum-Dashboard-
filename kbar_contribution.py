@@ -132,6 +132,21 @@ def _max_drawdown_log_from_close(close: pd.Series) -> float:
     return float(np.min(dd))
 
 
+def _max_drawdown_log_from_logrets(logrets: np.ndarray) -> float:
+    """Max drawdown computed on cumulative log-return series (period-level)."""
+    if logrets is None:
+        return 0.0
+    v = np.array(logrets, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return 0.0
+    cum = np.cumsum(v)
+    run_max = np.maximum.accumulate(cum)
+    dd = cum - run_max
+    return float(np.min(dd)) if dd.size else 0.0
+
+
+
 def _logret_to_ret_pct(logret: float) -> float:
     if not np.isfinite(logret):
         return np.nan
@@ -571,6 +586,8 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
                     # ✅ NEW: 周/月波動率（logret std）
                     "week_vol_logret_std": week_vol_logret_std,
                     "month_vol_logret_std": month_vol_logret_std,
+                    "year_weekly_max_drawdown_log": year_weekly_max_drawdown_log,
+                    "year_monthly_max_drawdown_log": year_monthly_max_drawdown_log,
 
                     # ✅ NEW: 最後兩週/兩月幅度變化率
                     "prev_week_ret_pct": prev_week_ret_pct if np.isfinite(prev_week_ret_pct) else np.nan,
