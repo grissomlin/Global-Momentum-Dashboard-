@@ -13,6 +13,7 @@ data_cleaning.py
 ✅ 提供：
 - detect_pingpong_mask(): 只偵測（回傳 mask 與原因）
 - clean_pingpong():      直接清洗（可選擇是否重算 prev_close / daily_change）
+- clean_pingpong_daily():（新增）日K pipeline 標準入口（contribution/aggregator 可直接呼叫）
 
 注意：
 - 本檔案只做「資料品質清洗」，不依賴 market_rules，也不碰漲停判定。
@@ -21,7 +22,7 @@ data_cleaning.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple
+from typing import Optional, Tuple, Union, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -32,12 +33,12 @@ import pandas as pd
 # -----------------------------
 @dataclass(frozen=True)
 class CleaningConfig:
-    date_col: str = "date"             # 或 "Date"
-    price_col: str = "close"           # 或 "Adj Close"
-    pingpong_threshold: float = 0.40   # 40%
+    date_col: str = "date"               # 或 "Date"
+    price_col: str = "close"             # 或 "Adj Close"
+    pingpong_threshold: float = 0.40     # 40%
     abs_ret_cap: Optional[float] = 0.80  # 80%（None 表示不啟用）
     require_min_rows: int = 5
-    keep_first_row: bool = True        # 避免把第一天 drop 掉（因 pct_change=NaN）
+    keep_first_row: bool = True          # 避免把第一天 drop 掉（因 pct_change=NaN）
 
 
 # -----------------------------
@@ -58,6 +59,22 @@ def _safe_pct_change(price: pd.Series) -> pd.Series:
     # 避免 0 或負值造成怪異 pct
     p = p.where(p > 0, np.nan)
     return p.pct_change()
+
+
+def _guess_date_col(df: pd.DataFrame, default: str = "date") -> str:
+    # 常見候選：date / Date / datetime / timestamp
+    for c in ["date", "Date", "datetime", "Datetime", "timestamp", "Timestamp"]:
+        if c in df.columns:
+            return c
+    return default
+
+
+def _guess_price_col(df: pd.DataFrame, default: str = "close") -> str:
+    # 常見候選：close / Adj Close / adj_close / AdjClose
+    for c in ["close", "Close", "Adj Close", "adj_close", "AdjClose", "adjClose"]:
+        if c in df.columns:
+            return c
+    return default
 
 
 # -----------------------------
@@ -136,10 +153,7 @@ def detect_pingpong_mask(
     drop_mask.loc[orig_index.values] = drop_local.values
 
     reasons = pd.DataFrame(
-        {
-            "is_abs_cap": 0,
-            "is_pingpong": 0,
-        },
+        {"is_abs_cap": 0, "is_pingpong": 0},
         index=df.index,
         dtype=int,
     )
@@ -156,6 +170,9 @@ def clean_pingpong(
     df: pd.DataFrame,
     config: CleaningConfig = CleaningConfig(),
     *,
+    # ✅ 新增：允許直接覆蓋 threshold/abs_cap（外部呼叫更方便）
+    threshold: Optional[float] = None,
+    abs_cap: Optional[float] = None,
     # 若你是 SQLite pipeline 日K聚合：通常想重算這兩個
     recompute_prev_close: bool = False,
     recompute_daily_change: bool = False,
@@ -163,39 +180,50 @@ def clean_pingpong(
     daily_change_col: str = "daily_change",
     # 回傳原因方便你 debug
     return_reasons: bool = False,
-) -> pd.DataFrame | Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]:
     """
     直接清洗 df，剔除 pingpong/abs-cap 日。
 
+    - threshold / abs_cap：會覆蓋 config 內設定（若傳入）
     - recompute_prev_close / recompute_daily_change：清洗後重算（同一 symbol 內）
       ⚠️ 本函數不分組，你若是多檔股票，請在外面 groupby(symbol) 後再呼叫。
     """
     if df is None or df.empty:
         return (df.copy(), pd.DataFrame()) if return_reasons else df.copy()
 
-    drop_mask, reasons = detect_pingpong_mask(df, config=config)
+    # 覆蓋 config（保持 dataclass frozen，不直接改）
+    cfg = config
+    if threshold is not None or abs_cap is not None:
+        cfg = CleaningConfig(
+            date_col=config.date_col,
+            price_col=config.price_col,
+            pingpong_threshold=float(threshold) if threshold is not None else config.pingpong_threshold,
+            abs_ret_cap=abs_cap if abs_cap is not None else config.abs_ret_cap,
+            require_min_rows=config.require_min_rows,
+            keep_first_row=config.keep_first_row,
+        )
 
+    drop_mask, reasons = detect_pingpong_mask(df, config=cfg)
     out = df.loc[~drop_mask].copy()
 
     # 重新排序（保持時間序）
-    date_col = config.date_col
+    date_col = cfg.date_col
     out[date_col] = _ensure_datetime_col(out, date_col)
     out = out.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
 
     # 清洗後可選重算 prev_close / daily_change
     if recompute_prev_close:
-        if config.price_col in out.columns:
-            out[prev_close_col] = pd.to_numeric(out[config.price_col], errors="coerce").shift(1)
-        elif "close" in out.columns:
-            out[prev_close_col] = pd.to_numeric(out["close"], errors="coerce").shift(1)
+        base_col = cfg.price_col if cfg.price_col in out.columns else ("close" if "close" in out.columns else None)
+        if base_col is not None:
+            out[prev_close_col] = pd.to_numeric(out[base_col], errors="coerce").shift(1)
 
     if recompute_daily_change:
-        # 以 price_col 為主；否則 fallback close
-        base_col = config.price_col if config.price_col in out.columns else "close"
-        out[daily_change_col] = pd.to_numeric(out[base_col], errors="coerce").pct_change()
+        base_col = cfg.price_col if cfg.price_col in out.columns else ("close" if "close" in out.columns else None)
+        if base_col is not None:
+            out[daily_change_col] = pd.to_numeric(out[base_col], errors="coerce").pct_change()
 
     if return_reasons:
-        # reasons 是針對原 df 的 index；這裡回傳原 reasons，讓你可以對照被刪掉哪些
+        # reasons 是針對原 df 的 index；回傳原 reasons，讓你可以對照被刪掉哪些
         return out, reasons
 
     return out
@@ -233,6 +261,60 @@ def preset_close_cleaning(
 
 
 # -----------------------------
+# ✅ Standard entry for daily pipeline (NEW)
+# -----------------------------
+def clean_pingpong_daily(
+    df: pd.DataFrame,
+    *,
+    threshold: float = 0.40,
+    abs_cap: Optional[float] = 0.80,
+    date_col: Optional[str] = None,
+    price_col: Optional[str] = None,
+    recompute_prev_close: bool = True,
+    recompute_daily_change: bool = False,
+    prev_close_col: str = "prev_close",
+    daily_change_col: str = "daily_change",
+    return_reasons: bool = False,
+) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]:
+    """
+    給 processor/kbar_aggregator/kbar_contribution 用的「標準入口」：
+    - 自動猜 date_col / price_col（除非你明確指定）
+    - 預設重算 prev_close（清洗後最常需要）
+    - threshold / abs_cap 直接可調
+    """
+    if df is None or df.empty:
+        return (df.copy(), pd.DataFrame()) if return_reasons else df.copy()
+
+    dcol = date_col or _guess_date_col(df, default="date")
+    pcol = price_col or _guess_price_col(df, default="close")
+
+    cfg = CleaningConfig(
+        date_col=dcol,
+        price_col=pcol,
+        pingpong_threshold=float(threshold),
+        abs_ret_cap=abs_cap,
+    )
+
+    return clean_pingpong(
+        df,
+        config=cfg,
+        threshold=threshold,
+        abs_cap=abs_cap,
+        recompute_prev_close=recompute_prev_close,
+        recompute_daily_change=recompute_daily_change,
+        prev_close_col=prev_close_col,
+        daily_change_col=daily_change_col,
+        return_reasons=return_reasons,
+    )
+
+
+# aliases (optional, for compatibility with other modules)
+pingpong_clean_daily = clean_pingpong_daily
+clean_daily_pingpong = clean_pingpong_daily
+clean_k_data_daily = clean_pingpong_daily
+
+
+# -----------------------------
 # Example usage (do not run in production import)
 # -----------------------------
 if __name__ == "__main__":
@@ -243,9 +325,8 @@ if __name__ == "__main__":
             "close": [100, 160, 96, 97, 98, 99, 100],  # 100->160 (+60%), 160->96 (-40%) pingpong-ish
         }
     )
-    cfg = preset_close_cleaning()
-    cleaned, rs = clean_pingpong(
-        toy, cfg, recompute_prev_close=True, recompute_daily_change=True, return_reasons=True
+    cleaned, rs = clean_pingpong_daily(
+        toy, threshold=0.40, abs_cap=0.80, recompute_prev_close=True, recompute_daily_change=True, return_reasons=True
     )
     print("raw:\n", toy)
     print("reasons:\n", rs)
