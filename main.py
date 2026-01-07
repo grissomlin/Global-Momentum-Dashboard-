@@ -1,3 +1,25 @@
+# -----------------------------------------------------------------------------
+# Google Drive helpers（相容層）
+# - 之前 only_feature.py 會從 main.py import 這些函式
+# - 現在正式實作放在 gdrive_utils.py
+# -----------------------------------------------------------------------------
+try:
+    from gdrive_utils import get_drive_service, download_file_from_drive, upload_file_to_drive_stable
+    def download_db_from_drive(service, db_file: str, folder_id: str | None = None) -> bool:
+        folder_id = folder_id or os.getenv("GDRIVE_FOLDER_ID")
+        if not folder_id:
+            return False
+        return bool(download_file_from_drive(service, file_name=db_file, output_path=db_file, folder_id=folder_id))
+
+    def upload_db_to_drive(service, db_file: str, folder_id: str | None = None) -> bool:
+        folder_id = folder_id or os.getenv("GDRIVE_FOLDER_ID")
+        if not folder_id:
+            return False
+        return bool(upload_file_to_drive_stable(service, local_path=db_file, drive_folder_id=folder_id, drive_filename=db_file))
+except Exception:
+    # main.py 本體不一定需要 Drive 功能
+    pass
+
 # main.py
 # -*- coding: utf-8 -*-
 
