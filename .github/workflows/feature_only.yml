@@ -1,18 +1,27 @@
-name: Only Feature Engineering
+name: Only Feature Engineering (Parallel)
 
 on:
   workflow_dispatch:
     inputs:
       market:
-        description: '選擇要加工的市場 (tw / us / cn / hk / jp / kr / all)'
+        description: "選擇要加工的市場 (tw / us / cn / hk / jp / kr / all)"
         required: true
-        default: 'tw'
+        default: "tw"
         type: choice
         options: [tw, us, cn, hk, jp, kr, all]
 
 jobs:
   process:
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        market: ${{ 
+          github.event.inputs.market == 'all'
+          && fromJSON('["tw","us","cn","hk","jp","kr"]')
+          || fromJSON(format('["{0}"]', github.event.inputs.market))
+        }}
 
     env:
       GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
@@ -25,8 +34,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install Dependencies
         run: |
@@ -34,42 +43,35 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pandas numpy google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dotenv
 
-      - name: 💾 Restore DB Cache
-        uses: actions/cache@v3
+      # 可選：DB cache（這版 key 會真的命中）
+      - name: 💾 Restore DB Cache (optional)
+        uses: actions/cache@v4
         with:
           path: "*.db"
-          # all 模式會共用同一份 cache key；單市場則用 market prefix
-          key: ${{ github.event.inputs.market }}-db-v3-${{ github.run_id }}
+          key: ${{ matrix.market }}-db-v3
           restore-keys: |
-            ${{ github.event.inputs.market }}-db-v3-
+            ${{ matrix.market }}-db-v3
 
       - name: 🧪 Run Processing & Sync to Cloud
         shell: bash
         run: |
           set -euo pipefail
-          M="${{ github.event.inputs.market }}"
-          if [ "$M" = "all" ]; then
-            echo "🧪 Running all markets: tw/us/cn/hk/jp/kr"
-            python -u only_feature.py all
-          else
-            echo "🧪 Running single market: $M"
-            python -u only_feature.py "$M"
-          fi
+          echo "🧪 Running market: ${{ matrix.market }}"
+          python -u only_feature.py ${{ matrix.market }}
 
-      - name: 📢 Trigger Alpha Data Lab Sync
+      # 成功才觸發另一個 Repo（每個市場各觸發一次）
+      # 若你不想 all 時觸發 6 次，改成：
+      # if: success() && github.event.inputs.market != 'all'
+      - name: 📢 Trigger Alpha Data Lab Sync (optional)
         if: success()
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+        shell: bash
         run: |
-          M="${{ github.event.inputs.market }}"
-          if [ "$M" = "all" ]; then
-            echo "⏭️ all 模式：略過單一 DB 的 repo dispatch（你也可以改成逐市場 dispatch）"
-            exit 0
-          fi
-
-          DB_NAME="${M}_stock_warehouse"
-          echo "🚀 市場 ${M} 加工完成，通知 Alpha Data Lab..."
-          curl -X POST https://api.github.com/repos/grissomlin/Alpha-Data-Cleaning-Lab/dispatches \
-          -H "Accept: application/vnd.github.v3+json" \
-          -H "Authorization: bearer $GH_PAT" \
-          -d "{\"event_type\": \"warehouse_sync_complete\", \"client_payload\": {\"market_db\": \"$DB_NAME\"}}"
+          set -euo pipefail
+          DB_NAME="${{ matrix.market }}_stock_warehouse"
+          echo "🚀 市場 ${{ matrix.market }} 加工完成，通知 Alpha Data Lab..."
+          curl -sS -X POST https://api.github.com/repos/grissomlin/Alpha-Data-Cleaning-Lab/dispatches \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: bearer $GH_PAT" \
+            -d "{\"event_type\": \"warehouse_sync_complete\", \"client_payload\": {\"market_db\": \"$DB_NAME\"}}"
