@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 kbar_contribution.py  (精準切段版｜都來｜不刪舊功能，只加)
------------------------------------------------------------
+-----------------------------------------------
 依賴：
 - kbar_aggregator.py -> kbar_weekly / kbar_monthly / kbar_yearly
 - processor.py -> stock_analysis（需 open/close/prev_close/is_limit_up）
@@ -11,20 +11,35 @@ kbar_contribution.py  (精準切段版｜都來｜不刪舊功能，只加)
 - year_contribution
 - year_contribution_bins
 
-新增（本次）：
-- top_week_id_net
-- top_week_logret_net
-- top_week_is_limitup_dense
-- limitup_count_in_top1week_to_peak
+新增（你說「都來」）：
+- burst_style_week / burst_style_month：
+    * ONE_WEEK_BURST  : top1_week_share_net >= 0.5
+    * ONE_MONTH_BURST : top1_month_share_net >= 0.5
+
+本次修改（重點）：
+- 使用 data_cleaning.py 來清洗 stock_analysis（日K），並在清洗後重算 prev_close + d_logret
+  => 避免減資/併股等極端跳動污染貢獻度（與你的 kbar_aggregator 口徑一致化）
 """
 
 import sys
 import sqlite3
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 
 SQLITE_TIMEOUT = 120
+
+
+# -----------------------------------------------------------------------------
+# ✅ optional import: data_cleaning
+# -----------------------------------------------------------------------------
+DATA_CLEANING_AVAILABLE = False
+try:
+    # 同 repo 直接 import
+    from data_cleaning import preset_close_cleaning, clean_pingpong  # type: ignore
+    DATA_CLEANING_AVAILABLE = True
+except Exception:
+    DATA_CLEANING_AVAILABLE = False
 
 
 # -----------------------------------------------------------------------------
@@ -164,45 +179,101 @@ def _align_peak_trade_date(daily_dates: pd.Series, peak_date: pd.Timestamp) -> O
     return pd.Timestamp(dd2.iloc[-1])
 
 
-def _find_top_week_net(
-    wps: pd.DataFrame,
-    w_logrets: np.ndarray,
-) -> Tuple[Optional[str], float, Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+# -----------------------------------------------------------------------------
+# ✅ daily cleaning + recompute d_logret
+# -----------------------------------------------------------------------------
+def _recompute_d_logret_in_year(d: pd.DataFrame) -> pd.DataFrame:
     """
-    回傳：
-    - top_week_id_net
-    - top_week_logret_net
-    - top_week_start
-    - top_week_end
+    d: 單一 symbol + 單一年份，且已依 date 排序。
+    - 先確保 prev_close 連續（用 close shift）
+    - 再計算 d_logret：
+        * 非第一天：log(close/prev_close)
+        * 第一天：   log(close/open)（與你原本邏輯一致）
     """
-    if wps.empty or w_logrets.size == 0:
-        return None, 0.0, None, None
+    out = d.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
-    # 找最大 net logret 的 index
-    idx = int(np.nanargmax(w_logrets))
-    top_row = wps.iloc[idx]
-    top_id = str(top_row["week_id"]) if "week_id" in top_row else None
-    top_lr = float(w_logrets[idx]) if np.isfinite(w_logrets[idx]) else 0.0
-    ts = top_row["period_start"]
-    te = top_row["period_end"]
-    ts = pd.Timestamp(ts) if pd.notna(ts) else None
-    te = pd.Timestamp(te) if pd.notna(te) else None
-    return top_id, top_lr, ts, te
+    # prev_close 用 close shift 重算（避免剔除後斷裂）
+    out["prev_close"] = pd.to_numeric(out["close"], errors="coerce").shift(1)
+
+    # rank in year
+    out["rank_in_year"] = np.arange(len(out), dtype=int)
+
+    # d_logret
+    out["d_logret"] = 0.0
+
+    close = pd.to_numeric(out["close"], errors="coerce")
+    prev = pd.to_numeric(out["prev_close"], errors="coerce")
+    open_ = pd.to_numeric(out["open"], errors="coerce")
+
+    mask_cp = (close > 0) & (prev > 0)
+    out.loc[mask_cp, "d_logret"] = np.log(close[mask_cp] / prev[mask_cp])
+
+    # first day uses close/open
+    mask_first = out["rank_in_year"] == 0
+    mask_oc = mask_first & (close > 0) & (open_ > 0)
+    out.loc[mask_oc, "d_logret"] = np.log(close[mask_oc] / open_[mask_oc])
+
+    return out
 
 
-def _count_limitups_in_range(daily: pd.DataFrame, start: Optional[pd.Timestamp], end: Optional[pd.Timestamp]) -> int:
-    if daily.empty or start is None or end is None:
-        return 0
-    d = daily.copy()
+def _maybe_clean_daily(d: pd.DataFrame, enable_cleaning: bool, pingpong_threshold: float, abs_ret_cap: float) -> pd.DataFrame:
+    """
+    清洗單一 symbol+year 的日K，並重算 prev_close + d_logret
+    """
+    if d.empty:
+        return d
+
+    d = d.copy()
     d["date"] = pd.to_datetime(d["date"], errors="coerce")
-    mask = (d["date"] >= start) & (d["date"] <= end)
-    return int((d.loc[mask, "is_limit_up"] == 1).sum())
+    d = d.dropna(subset=["date"]).sort_values("date")
+
+    if (not enable_cleaning) or (not DATA_CLEANING_AVAILABLE):
+        # 沒清洗也要確保 d_logret 正確（避免 stock_analysis 欄位不一致）
+        return _recompute_d_logret_in_year(d)
+
+    # 使用 data_cleaning 的 close preset
+    cfg = preset_close_cleaning(date_col="date", pingpong_threshold=pingpong_threshold, abs_ret_cap=abs_ret_cap)
+
+    # clean_pingpong 建議以 close 做清洗，然後重算 prev_close
+    cleaned = clean_pingpong(
+        d,
+        cfg,
+        recompute_prev_close=True,
+        recompute_daily_change=False,  # 這支貢獻度不吃 daily_change
+        prev_close_col="prev_close",
+        daily_change_col="daily_change",
+        return_reasons=False,
+    )
+
+    # 清洗後再重算 d_logret（用重算後的 prev_close）
+    cleaned = _recompute_d_logret_in_year(cleaned)
+
+    # is_limit_up 保留（clean_pingpong 不會刪欄）
+    if "is_limit_up" in d.columns and "is_limit_up" in cleaned.columns:
+        cleaned["is_limit_up"] = pd.to_numeric(cleaned["is_limit_up"], errors="coerce").fillna(0).astype(int)
+
+    return cleaned
 
 
 # -----------------------------------------------------------------------------
 # core
 # -----------------------------------------------------------------------------
-def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) -> Dict[str, int]:
+def build_contribution_tables(
+    db_path: str,
+    only_markets: Optional[set] = None,
+    *,
+    enable_cleaning: bool = True,
+    pingpong_threshold: float = 0.40,
+    abs_ret_cap: float = 0.80,
+    verbose: bool = True,
+) -> Dict[str, int]:
+    """
+    enable_cleaning:
+      - True 且 data_cleaning.py 可用：會對每個 symbol-year 的日K做清洗 + 重算 d_logret
+      - False：不清洗，但仍會重算 d_logret 以保持口徑一致
+    """
     conn = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT)
 
     try:
@@ -211,6 +282,10 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
         missing = [t for t in required if t not in existing]
         if missing:
             raise RuntimeError(f"缺少必要表：{missing}\n請先跑 processor.py 與 kbar_aggregator.py")
+
+        if enable_cleaning and not DATA_CLEANING_AVAILABLE:
+            if verbose:
+                print("⚠️ enable_cleaning=True 但找不到 data_cleaning.py（或 import 失敗），將改為不清洗（但仍重算 d_logret）。")
 
         # 年K
         y = pd.read_sql(
@@ -224,7 +299,8 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             conn,
         )
         if y.empty:
-            print("❌ kbar_yearly 無資料")
+            if verbose:
+                print("❌ kbar_yearly 無資料")
             return {"year_rows": 0, "bin_rows": 0}
 
         # 市場過濾（可選）
@@ -236,7 +312,8 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             y = y[y["market"].str.lower().isin(set([m.lower() for m in only_markets]))].copy()
             y = y.drop(columns=["market"], errors="ignore")
             if y.empty:
-                print("❌ only_markets 過濾後 kbar_yearly 無資料")
+                if verbose:
+                    print("❌ only_markets 過濾後 kbar_yearly 無資料")
                 return {"year_rows": 0, "bin_rows": 0}
 
         y["period_start"] = pd.to_datetime(y["period_start"], errors="coerce")
@@ -245,9 +322,11 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
 
         # 年報酬
         y["year_ret_pct"] = (y["y_close"].astype(float) / y["y_open"].astype(float) - 1.0) * 100.0
-        y["year_logret"] = np.log(y["y_close"].astype(float) / y["y_open"].astype(float)).replace(
-            [np.inf, -np.inf], np.nan
-        ).fillna(0.0)
+        y["year_logret"] = (
+            np.log(y["y_close"].astype(float) / y["y_open"].astype(float))
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
 
         # 年K分箱
         y["year_ret_bin_100"] = y["year_ret_pct"].apply(_bin_year_ret_100)
@@ -269,6 +348,7 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             """,
             conn,
         )
+
         wk["period_start"] = pd.to_datetime(wk["period_start"], errors="coerce")
         wk["period_end"] = pd.to_datetime(wk["period_end"], errors="coerce")
         mk["period_start"] = pd.to_datetime(mk["period_start"], errors="coerce")
@@ -287,31 +367,31 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
         sa["year"] = sa["date"].dt.year.astype(int)
         sa["is_limit_up"] = pd.to_numeric(sa["is_limit_up"], errors="coerce").fillna(0).astype(int)
 
-        # 逐日 logret：
-        sa["d_logret"] = 0.0
-        mask_cp = (sa["close"].astype(float) > 0) & (sa["prev_close"].astype(float) > 0)
-        sa.loc[mask_cp, "d_logret"] = np.log(sa.loc[mask_cp, "close"].astype(float) / sa.loc[mask_cp, "prev_close"].astype(float))
-
-        sa["rank_in_year"] = sa.groupby(["symbol", "year"]).cumcount()
-        mask_first = sa["rank_in_year"] == 0
-        mask_oc = mask_first & (sa["close"].astype(float) > 0) & (sa["open"].astype(float) > 0)
-        sa.loc[mask_oc, "d_logret"] = np.log(sa.loc[mask_oc, "close"].astype(float) / sa.loc[mask_oc, "open"].astype(float))
-
         rows = []
         for _, r in y.iterrows():
             sym = r["symbol"]
             yr = int(r["year"])
+
             year_open = float(r["y_open"])
             year_close = float(r["y_close"])
             year_logret = float(r["year_logret"])
             denom_year = year_logret if year_logret > 0 else 0.0
 
-            d = sa[(sa["symbol"] == sym) & (sa["year"] == yr)].copy()
+            d0 = sa[(sa["symbol"] == sym) & (sa["year"] == yr)].copy()
+            if d0.empty:
+                continue
+
+            # ✅ 清洗 + 重算 d_logret（或至少重算 d_logret）
+            d = _maybe_clean_daily(
+                d0,
+                enable_cleaning=enable_cleaning,
+                pingpong_threshold=pingpong_threshold,
+                abs_ret_cap=abs_ret_cap,
+            )
             if d.empty:
                 continue
-            d = d.sort_values("date")
 
-            # 年內最大回撤
+            # 年內最大回撤（用 close）
             year_max_dd_log = _max_drawdown_log_from_close(d["close"])
 
             # peak date 對齊
@@ -327,13 +407,13 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             peak_logret = _safe_log_ratio(peak_close, year_open) if np.isfinite(peak_close) else 0.0
             denom_peak = peak_logret if peak_logret > 0 else 0.0
 
-            # 從 peak 到年末回撤（log）
+            # 從 peak 到年末回撤
             peak_to_year_end_dd_log = 0.0
             if peak_trade_date is not None and np.isfinite(peak_close) and peak_close > 0:
                 year_end_close = float(d.iloc[-1]["close"]) if np.isfinite(d.iloc[-1]["close"]) else np.nan
                 peak_to_year_end_dd_log = _safe_log_ratio(year_end_close, peak_close) if np.isfinite(year_end_close) else 0.0
 
-            # 週/月 periods（該股該年）
+            # 週/月 periods（該股該年）=> 建議 reset_index，避免日後你擴充要拿 iloc 對齊時踩坑
             wps = wk[(wk["symbol"] == sym) & (wk["year"] == yr)].sort_values("period_end").reset_index(drop=True)
             mps = mk[(mk["symbol"] == sym) & (mk["year"] == yr)].sort_values("period_end").reset_index(drop=True)
 
@@ -344,7 +424,7 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             worst_week_logret = float(np.nanmin(w_logrets)) if w_logrets.size > 0 else 0.0
             worst_month_logret = float(np.nanmin(m_logrets)) if m_logrets.size > 0 else 0.0
 
-            # 週/月集中度（POS/NET）
+            # 集中度（POS/NET）
             top1_week_share_pos = _topk_share_pos(w_logrets, denom_year, 1)
             top4_weeks_share_pos = _topk_share_pos(w_logrets, denom_year, 4)
             top1_week_share_net = _topk_share_net(w_logrets, denom_year, 1)
@@ -360,7 +440,7 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             sum_pos_month_share = _sum_pos_share(m_logrets, denom_year)
             sum_net_month_share = _sum_net_share(m_logrets, denom_year)
 
-            # ✅ burst label
+            # ✅ burst label（你說都來）
             burst_style_week = "ONE_WEEK_BURST" if top1_week_share_net >= 0.5 else "NON_CONCENTRATED"
             burst_style_month = "ONE_MONTH_BURST" if top1_month_share_net >= 0.5 else "NON_CONCENTRATED"
 
@@ -376,40 +456,39 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             w_logrets_to_peak = _sum_logret_by_period(daily=d, periods=wps, cutoff_date=peak_trade_date)
             m_logrets_to_peak = _sum_logret_by_period(daily=d, periods=mps, cutoff_date=peak_trade_date)
 
-            week_pos_log_share_to_peak_vs_year = float(np.nansum(w_logrets_to_peak[w_logrets_to_peak > 0]) / denom_year) if denom_year > 0 else 0.0
-            week_net_log_share_to_peak_vs_year = float(np.nansum(w_logrets_to_peak[np.isfinite(w_logrets_to_peak)]) / denom_year) if denom_year > 0 else 0.0
-            month_pos_log_share_to_peak_vs_year = float(np.nansum(m_logrets_to_peak[m_logrets_to_peak > 0]) / denom_year) if denom_year > 0 else 0.0
-            month_net_log_share_to_peak_vs_year = float(np.nansum(m_logrets_to_peak[np.isfinite(m_logrets_to_peak)]) / denom_year) if denom_year > 0 else 0.0
+            week_pos_log_share_to_peak_vs_year = (
+                float(np.nansum(w_logrets_to_peak[w_logrets_to_peak > 0]) / denom_year) if denom_year > 0 else 0.0
+            )
+            week_net_log_share_to_peak_vs_year = (
+                float(np.nansum(w_logrets_to_peak[np.isfinite(w_logrets_to_peak)]) / denom_year) if denom_year > 0 else 0.0
+            )
+            month_pos_log_share_to_peak_vs_year = (
+                float(np.nansum(m_logrets_to_peak[m_logrets_to_peak > 0]) / denom_year) if denom_year > 0 else 0.0
+            )
+            month_net_log_share_to_peak_vs_year = (
+                float(np.nansum(m_logrets_to_peak[np.isfinite(m_logrets_to_peak)]) / denom_year) if denom_year > 0 else 0.0
+            )
 
-            week_pos_log_share_to_peak_vs_peak = float(np.nansum(w_logrets_to_peak[w_logrets_to_peak > 0]) / denom_peak) if denom_peak > 0 else 0.0
-            week_net_log_share_to_peak_vs_peak = float(np.nansum(w_logrets_to_peak[np.isfinite(w_logrets_to_peak)]) / denom_peak) if denom_peak > 0 else 0.0
-            month_pos_log_share_to_peak_vs_peak = float(np.nansum(m_logrets_to_peak[m_logrets_to_peak > 0]) / denom_peak) if denom_peak > 0 else 0.0
-            month_net_log_share_to_peak_vs_peak = float(np.nansum(m_logrets_to_peak[np.isfinite(m_logrets_to_peak)]) / denom_peak) if denom_peak > 0 else 0.0
+            week_pos_log_share_to_peak_vs_peak = (
+                float(np.nansum(w_logrets_to_peak[w_logrets_to_peak > 0]) / denom_peak) if denom_peak > 0 else 0.0
+            )
+            week_net_log_share_to_peak_vs_peak = (
+                float(np.nansum(w_logrets_to_peak[np.isfinite(w_logrets_to_peak)]) / denom_peak) if denom_peak > 0 else 0.0
+            )
+            month_pos_log_share_to_peak_vs_peak = (
+                float(np.nansum(m_logrets_to_peak[m_logrets_to_peak > 0]) / denom_peak) if denom_peak > 0 else 0.0
+            )
+            month_net_log_share_to_peak_vs_peak = (
+                float(np.nansum(m_logrets_to_peak[np.isfinite(m_logrets_to_peak)]) / denom_peak) if denom_peak > 0 else 0.0
+            )
 
-            # 漲停貢獻（peak 前）
+            # peak 前漲停貢獻（日K logret）
             d_to_peak = d[d["date"] <= peak_trade_date] if peak_trade_date is not None else d
+
             limitup_count_to_peak = int((d_to_peak["is_limit_up"] == 1).sum())
             limitup_log_sum_to_peak = float(d_to_peak.loc[d_to_peak["is_limit_up"] == 1, "d_logret"].sum())
             limitup_log_share_to_peak_vs_year = float(limitup_log_sum_to_peak / denom_year) if denom_year > 0 else 0.0
             limitup_log_share_to_peak_vs_peak = float(limitup_log_sum_to_peak / denom_peak) if denom_peak > 0 else 0.0
-
-            # -----------------------------------------------------------------
-            # ✅ 新增：全年 top week (net) + 漲停密度
-            # -----------------------------------------------------------------
-            top_week_id_net, top_week_logret_net, top_week_start, top_week_end = _find_top_week_net(wps, w_logrets)
-            top_week_is_limitup_dense = _count_limitups_in_range(d, top_week_start, top_week_end)
-
-            # ✅ 新增：peak 前「最大貢獻週」裡的漲停數
-            # 定義：top1 week(net) 若落在 peak_trade_date 之後，則 0（因為你要 peak 前）
-            limitup_count_in_top1week_to_peak = 0
-            if peak_trade_date is not None and top_week_end is not None:
-                if top_week_end <= peak_trade_date:
-                    limitup_count_in_top1week_to_peak = top_week_is_limitup_dense
-                else:
-                    limitup_count_in_top1week_to_peak = 0
-            elif peak_trade_date is None:
-                # 沒 peak：那就等同全年 top1 week
-                limitup_count_in_top1week_to_peak = top_week_is_limitup_dense
 
             rows.append(
                 {
@@ -427,7 +506,7 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
                     "year_ret_bin_10_under100": r["year_ret_bin_10_under100"],
                     "year_ret_bin_50_under100": r["year_ret_bin_50_under100"],
 
-                    # burst
+                    # ✅ burst style
                     "burst_style_week": burst_style_week,
                     "burst_style_month": burst_style_month,
 
@@ -481,18 +560,13 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
                     "limitup_log_sum_to_peak": limitup_log_sum_to_peak,
                     "limitup_log_share_to_peak_vs_year": limitup_log_share_to_peak_vs_year,
                     "limitup_log_share_to_peak_vs_peak": limitup_log_share_to_peak_vs_peak,
-
-                    # ✅ 新增欄位（本次）
-                    "top_week_id_net": top_week_id_net,
-                    "top_week_logret_net": top_week_logret_net,
-                    "top_week_is_limitup_dense": top_week_is_limitup_dense,
-                    "limitup_count_in_top1week_to_peak": int(limitup_count_in_top1week_to_peak),
                 }
             )
 
         out = pd.DataFrame(rows)
         if out.empty:
-            print("❌ year_contribution 無資料（可能 year/kbar 對不起來或 stock_analysis 缺日K）")
+            if verbose:
+                print("❌ year_contribution 無資料（可能 year/kbar 對不起來或 stock_analysis 缺日K）")
             return {"year_rows": 0, "bin_rows": 0}
 
         # 寫回 year_contribution
@@ -504,7 +578,6 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_bin100 ON year_contribution(year_ret_bin_100)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_burst_week ON year_contribution(burst_style_week)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_burst_month ON year_contribution(burst_style_month)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_topweek ON year_contribution(top_week_id_net)")
         except Exception:
             pass
 
@@ -534,11 +607,6 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
                     "avg_limitup_log_share_to_peak_vs_year": float(df["limitup_log_share_to_peak_vs_year"].mean()),
                     "avg_limitup_log_share_to_peak_vs_peak": float(df["limitup_log_share_to_peak_vs_peak"].mean()),
 
-                    # ✅ 新增統計：top week net 與漲停密度
-                    "avg_top_week_logret_net": float(df["top_week_logret_net"].mean()),
-                    "avg_top_week_is_limitup_dense": float(df["top_week_is_limitup_dense"].mean()),
-                    "avg_limitup_count_in_top1week_to_peak": float(df["limitup_count_in_top1week_to_peak"].mean()),
-
                     # 回撤
                     "avg_year_max_drawdown_log": float(df["year_max_drawdown_log"].mean()),
                     "avg_peak_to_year_end_drawdown_log": float(df["peak_to_year_end_drawdown_log"].mean()),
@@ -562,10 +630,15 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
 
         conn.commit()
 
-        print("\n✅ kbar_contribution（精準切段｜新增 top week + 漲停密度）完成：")
-        print(f"📌 year_contribution rows: {len(out):,}")
-        print(f"📌 year_contribution_bins rows: {len(bins):,}")
-        print("📌 新增欄位：top_week_id_net, top_week_logret_net, top_week_is_limitup_dense, limitup_count_in_top1week_to_peak")
+        if verbose:
+            print("\n✅ kbar_contribution（精準切段｜都來｜已接 data_cleaning）完成：")
+            print(f"📌 year_contribution rows: {len(out):,}")
+            print(f"📌 year_contribution_bins rows: {len(bins):,}")
+            if enable_cleaning and DATA_CLEANING_AVAILABLE:
+                print(f"📌 清洗：pingpong_threshold={pingpong_threshold}, abs_ret_cap={abs_ret_cap}")
+            else:
+                print("📌 清洗：停用（但仍重算 d_logret 以保持一致）")
+            print("📌 burst labels：burst_style_week / burst_style_month 已加入")
 
         return {"year_rows": int(len(out)), "bin_rows": int(len(bins))}
 
