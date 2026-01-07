@@ -34,6 +34,13 @@ B) daytrade_events（隔日沖研究事件）
 ⚠️ 只支援 TW/CN/JP 的「精準漲停」：
 - 若 market_rules.py 存在且提供 calc_limit_up_price() / tick_size()，會用精準判定
 - 否則 fallback：TW=10%、CN=10/20%、JP=不判定（當作無漲停）
+
+✅ 本版本修正（重要）：
+- prev_close / daily_change 一律用 per-symbol groupby 計算或補缺（避免跨股票污染）
+- only_markets 真的生效（可指定只跑 tw/cn/jp 子集合）
+- 市場過濾不再用 apply(axis=1)（大幅加速）
+- tick buffer 更 robust（NaN/例外時不炸）
+- 完全不需要、也不會呼叫 data_cleaning.py
 """
 
 import sqlite3
@@ -41,6 +48,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import warnings
+from typing import Optional, Dict, Tuple, Iterable
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -48,7 +56,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # market_rules: 精準漲停判定（建議你一定要有）
 # -----------------------------
 try:
-    import market_rules
+    import market_rules  # type: ignore
     HAS_MARKET_RULES = True
 except Exception:
     market_rules = None
@@ -56,28 +64,22 @@ except Exception:
 
 
 # =============================================================================
-# 0) 小工具：判斷是否 TW/CN/JP
+# 0) 市場 key 判斷（向量化用）
 # =============================================================================
-def _is_target_market(market: str, symbol: str) -> bool:
+def _market_to_key(market: str, symbol: str) -> str:
     m = (market or "").upper().strip()
     sym = (symbol or "").upper().strip()
 
-    if m in ("TW", "TSE", "GTSM"):
-        return True
-    if m in ("SSE", "SZSE", "CN", "CHINA"):
-        return True
-    if m in ("JP", "JPX", "TSEJ"):  # 你可以依你的 downloader_jp 寫入的 market 值調整
-        return True
-
-    # fallback by suffix
-    if sym.endswith(".TW") or sym.endswith(".TWO"):
-        return True
-    if sym.endswith(".SS") or sym.endswith(".SZ"):
-        return True
-    if sym.endswith(".T"):
-        return True
-
-    return False
+    # TW
+    if m in ("TW", "TSE", "GTSM") or sym.endswith(".TW") or sym.endswith(".TWO"):
+        return "tw"
+    # CN
+    if m in ("SSE", "SZSE", "CN", "CHINA") or sym.endswith(".SS") or sym.endswith(".SZ"):
+        return "cn"
+    # JP
+    if m in ("JP", "JPX", "TSEJ") or sym.endswith(".T"):
+        return "jp"
+    return "other"
 
 
 # =============================================================================
@@ -86,12 +88,13 @@ def _is_target_market(market: str, symbol: str) -> bool:
 def _fallback_cn_limit_pct(symbol: str) -> float:
     sym = (symbol or "").upper()
     code = "".join([c for c in sym if c.isdigit()])
+    # CN: 創業板/科創板 20%
     if code.startswith(("300", "301", "688")):
         return 0.20
     return 0.10
 
 
-def _fallback_calc_limit_up_price(prev_close: pd.Series, market: str, symbol: str) -> pd.Series | None:
+def _fallback_calc_limit_up_price(prev_close: pd.Series, market: str, symbol: str) -> Optional[pd.Series]:
     m = (market or "").upper().strip()
     sym = (symbol or "").upper().strip()
 
@@ -158,10 +161,14 @@ def _calc_limit_flags(df_sym: pd.DataFrame) -> pd.DataFrame:
     - hit_limit_up_intraday (high >= limit)
     - limit_up_fail (high >= limit AND close < limit)
     """
+    if df_sym.empty:
+        return df_sym
+
     symbol = str(df_sym["symbol"].iloc[0])
     market = str(df_sym["market"].iloc[0]) if "market" in df_sym.columns else ""
+    market_detail = str(df_sym["market_detail"].iloc[0]) if "market_detail" in df_sym.columns else ""
 
-    prev_close = df_sym["prev_close"].astype(float)
+    prev_close = pd.to_numeric(df_sym.get("prev_close", np.nan), errors="coerce").astype(float)
 
     limit_price = None
     if HAS_MARKET_RULES and hasattr(market_rules, "calc_limit_up_price"):
@@ -169,7 +176,7 @@ def _calc_limit_flags(df_sym: pd.DataFrame) -> pd.DataFrame:
             limit_price = market_rules.calc_limit_up_price(
                 prev_close=prev_close,
                 market=market,
-                market_detail=str(df_sym["market_detail"].iloc[0]) if "market_detail" in df_sym.columns else "",
+                market_detail=market_detail,
                 symbol=symbol,
             )
         except Exception:
@@ -178,30 +185,47 @@ def _calc_limit_flags(df_sym: pd.DataFrame) -> pd.DataFrame:
     if limit_price is None:
         limit_price = _fallback_calc_limit_up_price(prev_close, market, symbol)
 
-    df_sym["limit_up_price"] = limit_price.astype(float) if limit_price is not None else np.nan
-
-    # buffer：若有 tick_size 用 tick*0.5 當容忍；否則用 0
-    if limit_price is not None and HAS_MARKET_RULES and hasattr(market_rules, "tick_size"):
-        try:
-            ticks = prev_close.apply(lambda x: market_rules.tick_size(float(x), market=market, symbol=symbol))
-            buffer = ticks.fillna(0) * 0.5
-        except Exception:
-            buffer = 0.0
-    else:
-        buffer = 0.0
-
     if limit_price is None:
+        df_sym["limit_up_price"] = np.nan
         df_sym["hit_limit_up_close"] = 0
         df_sym["hit_limit_up_intraday"] = 0
         df_sym["limit_up_fail"] = 0
         return df_sym
 
-    lim = df_sym["limit_up_price"].astype(float)
-    hi = df_sym["high"].astype(float)
-    cl = df_sym["close"].astype(float)
+    df_sym["limit_up_price"] = pd.to_numeric(limit_price, errors="coerce").astype(float)
 
-    df_sym["hit_limit_up_close"] = (cl >= (lim - buffer)).astype(int)
-    df_sym["hit_limit_up_intraday"] = (hi >= (lim - buffer)).astype(int)
+    # buffer：若有 tick_size，用 tick*1.0 當容忍；否則 0
+    buffer = 0.0
+    if HAS_MARKET_RULES and hasattr(market_rules, "tick_size"):
+        try:
+            # 對每列 prev_close 算 tick；NaN/<=0 -> 0
+            def _tick(x: float) -> float:
+                if not np.isfinite(x) or x <= 0:
+                    return 0.0
+                try:
+                    return float(market_rules.tick_size(float(x), market=market, symbol=symbol))
+                except Exception:
+                    return 0.0
+
+            ticks = prev_close.apply(_tick).fillna(0.0)
+            buffer = (ticks * 1.0).astype(float)  # 1 tick 容忍
+        except Exception:
+            buffer = 0.0
+
+    lim = pd.to_numeric(df_sym["limit_up_price"], errors="coerce").astype(float)
+    hi = pd.to_numeric(df_sym.get("high", np.nan), errors="coerce").astype(float)
+    cl = pd.to_numeric(df_sym.get("close", np.nan), errors="coerce").astype(float)
+
+    # 若 buffer 是 scalar
+    if isinstance(buffer, (int, float)):
+        buf = float(buffer)
+        df_sym["hit_limit_up_close"] = (cl >= (lim - buf)).astype(int)
+        df_sym["hit_limit_up_intraday"] = (hi >= (lim - buf)).astype(int)
+    else:
+        # buffer 是 series（同 index）
+        df_sym["hit_limit_up_close"] = (cl >= (lim - buffer)).astype(int)
+        df_sym["hit_limit_up_intraday"] = (hi >= (lim - buffer)).astype(int)
+
     df_sym["limit_up_fail"] = ((df_sym["hit_limit_up_intraday"] == 1) & (df_sym["hit_limit_up_close"] == 0)).astype(int)
     return df_sym
 
@@ -220,14 +244,15 @@ def _add_forward_metrics(df_sym: pd.DataFrame) -> pd.DataFrame:
     df_sym = df_sym.sort_values("date").copy()
 
     for col in ["open", "high", "low", "close"]:
-        df_sym[col] = pd.to_numeric(df_sym[col], errors="coerce")
+        if col in df_sym.columns:
+            df_sym[col] = pd.to_numeric(df_sym[col], errors="coerce")
 
     df_sym["next_open"] = df_sym["open"].shift(-1)
     df_sym["next_high"] = df_sym["high"].shift(-1)
     df_sym["next_low"] = df_sym["low"].shift(-1)
     df_sym["next_close"] = df_sym["close"].shift(-1)
 
-    # next day
+    # next day (close-based)
     df_sym["next_open_ret"] = (df_sym["next_open"] / df_sym["close"] - 1)
     df_sym["next_open_gap"] = (df_sym["next_open"] / df_sym["close"] - 1)  # 同 next_open_ret（命名給你文章好讀）
     df_sym["next_intraday_drawdown"] = (df_sym["next_low"] / df_sym["next_open"] - 1)
@@ -241,8 +266,7 @@ def _add_forward_metrics(df_sym: pd.DataFrame) -> pd.DataFrame:
     df_sym["ret_1d"] = (df_sym["close_t1"] / df_sym["close"] - 1)
     df_sym["ret_5d"] = (df_sym["close_t5"] / df_sym["close"] - 1)
 
-    # max up / max dd in next 5 days (using high/low)
-    # window: t+1..t+5
+    # max up / max dd in next 5 days (using high/low) window: t+1..t+5
     highs_fwd = pd.concat([df_sym["high"].shift(-i) for i in range(1, 6)], axis=1)
     lows_fwd = pd.concat([df_sym["low"].shift(-i) for i in range(1, 6)], axis=1)
 
@@ -255,7 +279,7 @@ def _add_forward_metrics(df_sym: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 # 5) 生成事件表
 # =============================================================================
-def build_event_tables(db_path: str, only_markets=("tw", "cn", "jp")) -> dict:
+def build_event_tables(db_path: str, only_markets: Iterable[str] = ("tw", "cn", "jp")) -> dict:
     """
     產生兩張表：
     - limit_up_events
@@ -268,12 +292,12 @@ def build_event_tables(db_path: str, only_markets=("tw", "cn", "jp")) -> dict:
 
     try:
         base = _read_base_df(conn)
-        if base.empty:
+        if base is None or base.empty:
             print("❌ event_engine: 找不到可用資料（stock_analysis/stock_prices 皆空）")
             return {"ok": False, "reason": "empty"}
 
-        # 統一欄位
-        base["date"] = pd.to_datetime(base["date"], errors="coerce")
+        # ====== 基礎清理（不依賴 data_cleaning.py）======
+        base["date"] = pd.to_datetime(base.get("date", None), errors="coerce")
         base = base.dropna(subset=["date"])
         base = base.sort_values(["symbol", "date"]).reset_index(drop=True)
 
@@ -281,59 +305,81 @@ def build_event_tables(db_path: str, only_markets=("tw", "cn", "jp")) -> dict:
         if "sector" not in base.columns and "info_sector" in base.columns:
             base["sector"] = base["info_sector"]
 
-        # prev_close 若不存在就補
-        if "prev_close" not in base.columns:
-            base["prev_close"] = pd.to_numeric(base["close"], errors="coerce").shift(1)
+        # numeric cast
+        for c in ["open", "high", "low", "close", "volume"]:
+            if c in base.columns:
+                base[c] = pd.to_numeric(base[c], errors="coerce")
 
-        # daily_change 若不存在就補
-        if "daily_change" not in base.columns:
-            base["daily_change"] = pd.to_numeric(base["close"], errors="coerce").pct_change()
+        # prev_close / daily_change 必須 per-symbol（避免跨股票污染）
+        base["prev_close"] = pd.to_numeric(base.get("prev_close", np.nan), errors="coerce")
+        base["prev_close"] = base["prev_close"].fillna(base.groupby("symbol")["close"].shift(1))
+
+        base["daily_change"] = pd.to_numeric(base.get("daily_change", np.nan), errors="coerce")
+        base["daily_change"] = base["daily_change"].fillna(base.groupby("symbol")["close"].pct_change())
 
         # is_limit_up 若不存在：先全部 0，後面會用精準判定回填
         if "is_limit_up" not in base.columns:
             base["is_limit_up"] = 0
+        base["is_limit_up"] = pd.to_numeric(base["is_limit_up"], errors="coerce").fillna(0).astype(int)
 
         # lu_type / consecutive_limits / is_one_tick_lock 若不存在：先補空（事件仍可跑）
         if "lu_type" not in base.columns:
             base["lu_type"] = None
         if "consecutive_limits" not in base.columns:
             base["consecutive_limits"] = 0
+        else:
+            base["consecutive_limits"] = pd.to_numeric(base["consecutive_limits"], errors="coerce").fillna(0).astype(int)
+
         if "is_one_tick_lock" not in base.columns:
             base["is_one_tick_lock"] = (
                 (base["open"] == base["close"]) &
                 (base["high"] == base["low"]) &
                 (base["high"] == base["close"])
             ).astype(int)
+        else:
+            base["is_one_tick_lock"] = pd.to_numeric(base["is_one_tick_lock"], errors="coerce").fillna(0).astype(int)
 
-        # 只處理 tw/cn/jp（其他市場直接跳過）
-        base["_target_market"] = base.apply(
-            lambda r: _is_target_market(str(r.get("market", "")), str(r.get("symbol", ""))),
-            axis=1,
-        )
-        base = base[base["_target_market"] == True].drop(columns=["_target_market"])
+        # ====== 市場 gate（only_markets 真正生效）======
+        only = set([str(m).lower().strip() for m in (only_markets or ())])
+        if not only:
+            only = {"tw", "cn", "jp"}
+
+        # 缺 market 欄位也能用 suffix 推斷（market_to_key 有處理）
+        mcol = base["market"] if "market" in base.columns else ""
+        base["_mkey"] = [_market_to_key(mk, sym) for mk, sym in zip(mcol, base["symbol"].astype(str))]
+        base = base[base["_mkey"].isin(only)].drop(columns=["_mkey"])
+
         if base.empty:
-            print("⏭️ event_engine: 本 DB 無 TW/CN/JP 資料，跳過")
+            print("⏭️ event_engine: 本 DB 無指定市場資料，跳過")
             return {"ok": True, "skipped": True, "reason": "no_target_markets"}
 
-        # per-symbol: limit flags + forward metrics
+        # ====== per-symbol: limit flags + forward metrics ======
         out_list = []
         for sym, g in base.groupby("symbol", sort=False):
             g = g.sort_values("date").copy()
 
-            # prev_close 確保正確（每檔內）
-            g["prev_close"] = pd.to_numeric(g["close"], errors="coerce").shift(1)
+            # prev_close：只補缺失（不要把 processor 的 prev_close 全洗掉）
+            g["prev_close"] = pd.to_numeric(g.get("prev_close", np.nan), errors="coerce")
+            g["prev_close"] = g["prev_close"].fillna(pd.to_numeric(g["close"], errors="coerce").shift(1))
+
+            # daily_change：只補缺失（per-symbol）
+            g["daily_change"] = pd.to_numeric(g.get("daily_change", np.nan), errors="coerce")
+            g["daily_change"] = g["daily_change"].fillna(pd.to_numeric(g["close"], errors="coerce").pct_change())
 
             # 精準判定：今日是否 hit close / intraday / fail
             g = _calc_limit_flags(g)
 
-            # 若 processor 有 is_limit_up，就以 processor 為主；否則用 hit_limit_up_close
-            # 但你要做事件「衝漲停失敗」需要 limit_up_fail，所以仍保留 hit flags
+            # 若 processor 有 is_limit_up，就以 processor 為主；
+            # 但仍保留 hit flags 供「衝漲停失敗」事件使用
+            # ⚠️ 你原本會覆蓋 processor 的 is_limit_up（只要算得出 limit_up_price）
+            # 這裡維持你原邏輯，但更安全：僅在 hit 欄位有效時覆蓋
             if "is_limit_up" in g.columns and g["is_limit_up"].notna().any():
-                # 有時 processor 對 JP 可能先沒有精準，這裡用 market_rules 精準結果覆蓋（只覆蓋 target）
-                # 你若不想覆蓋，把下面兩行註解掉
-                g["is_limit_up"] = np.where(g["limit_up_price"].notna(), g["hit_limit_up_close"], g["is_limit_up"])
+                if "limit_up_price" in g.columns and g["limit_up_price"].notna().any():
+                    g["is_limit_up"] = np.where(g["limit_up_price"].notna(), g["hit_limit_up_close"], g["is_limit_up"])
             else:
-                g["is_limit_up"] = g["hit_limit_up_close"]
+                g["is_limit_up"] = g.get("hit_limit_up_close", 0)
+
+            g["is_limit_up"] = pd.to_numeric(g["is_limit_up"], errors="coerce").fillna(0).astype(int)
 
             # forward metrics
             g = _add_forward_metrics(g)
@@ -352,7 +398,6 @@ def build_event_tables(db_path: str, only_markets=("tw", "cn", "jp")) -> dict:
         # =========================
         lu = df[df["is_limit_up"] == 1].copy()
 
-        # 事件日基本欄位
         keep_cols = [
             "symbol", "date", "market", "market_detail", "sector",
             "open", "high", "low", "close", "volume",
@@ -365,8 +410,6 @@ def build_event_tables(db_path: str, only_markets=("tw", "cn", "jp")) -> dict:
         ]
         keep_cols = [c for c in keep_cols if c in lu.columns]
         lu_events = lu[keep_cols].copy()
-
-        # 格式化 date（SQLite）
         lu_events["date"] = pd.to_datetime(lu_events["date"]).dt.strftime("%Y-%m-%d")
 
         # =========================
@@ -374,19 +417,10 @@ def build_event_tables(db_path: str, only_markets=("tw", "cn", "jp")) -> dict:
         # =========================
         dt = df.copy()
 
-        # (1) 昨天漲停 今天沒漲停（隔日沖最常見的釋放）
         dt["prev_limit_up_today_not"] = ((dt["prev_is_limit_up"] == 1) & (dt["is_limit_up"] == 0)).astype(int)
-
-        # (2) 昨天漲停 今天盤中再摸到漲停但收不住（衝高回落）
         dt["prev_limit_up_today_fail"] = ((dt["prev_is_limit_up"] == 1) & (dt["limit_up_fail"] == 1)).astype(int)
-
-        # (3) 昨天沒漲停 今天衝漲停失敗
         dt["today_limit_up_fail_no_prev"] = ((dt["prev_is_limit_up"] == 0) & (dt["limit_up_fail"] == 1)).astype(int)
-
-        # (4) 昨天沒漲停 今天收漲停（首板）
         dt["today_limit_up_yes_no_prev"] = ((dt["prev_is_limit_up"] == 0) & (dt["is_limit_up"] == 1)).astype(int)
-
-        # 你要的「昨天漲停今天沒漲」 +「昨天沒漲停今天衝漲停失敗」都在上面
 
         dt_cols = [
             "symbol", "date", "market", "market_detail", "sector",
@@ -426,7 +460,10 @@ def build_event_tables(db_path: str, only_markets=("tw", "cn", "jp")) -> dict:
         conn.commit()
 
         dt_sec = (datetime.now() - t0).total_seconds()
-        print(f"✅ event_engine: 事件表已產生 | limit_up_events={len(lu_events):,} | daytrade_events={len(daytrade_events):,} | {dt_sec:.1f}s")
+        print(
+            f"✅ event_engine: 事件表已產生 | "
+            f"limit_up_events={len(lu_events):,} | daytrade_events={len(daytrade_events):,} | {dt_sec:.1f}s"
+        )
 
         return {
             "ok": True,
@@ -444,6 +481,7 @@ def build_event_tables(db_path: str, only_markets=("tw", "cn", "jp")) -> dict:
 if __name__ == "__main__":
     # 範例：python event_engine.py tw_stock_warehouse.db
     import sys
+
     if len(sys.argv) >= 2:
         db = sys.argv[1]
     else:
