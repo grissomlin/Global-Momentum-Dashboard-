@@ -31,7 +31,7 @@ from gdrive_utils import (
 )
 
 
-def download_db_from_drive(service, db_file: str, folder_id: str, verbose: bool = True) -> bool:
+def download_db_from_drive(service, db_file: str, folder_id: str) -> bool:
     """
     從 Drive folder 下載 db_file 到本地同名檔案。
     gdrive_utils.download_file_from_drive 的參數是 local_path（不是 output_path）。
@@ -42,7 +42,6 @@ def download_db_from_drive(service, db_file: str, folder_id: str, verbose: bool 
             folder_id=folder_id,
             file_name=db_file,
             local_path=db_file,
-            verbose=verbose,
         )
         return bool(ok)
     except Exception as e:
@@ -50,7 +49,7 @@ def download_db_from_drive(service, db_file: str, folder_id: str, verbose: bool 
         return False
 
 
-def upload_db_to_drive(service, db_file: str, folder_id: str, verbose: bool = True) -> bool:
+def upload_db_to_drive(service, db_file: str, folder_id: str) -> bool:
     """把本地 db_file 上傳回 Drive folder（同名覆蓋/更新）。"""
     try:
         ok = upload_file_to_drive_stable(
@@ -58,7 +57,6 @@ def upload_db_to_drive(service, db_file: str, folder_id: str, verbose: bool = Tr
             folder_id=folder_id,
             local_path=db_file,
             file_name=db_file,
-            verbose=verbose,
         )
         return bool(ok)
     except Exception as e:
