@@ -4,28 +4,40 @@ import os
 import sqlite3
 import pandas as pd
 import streamlit as st
-from datetime import datetime
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def list_db_files(search_dirs):
-    out = []
-    for d in search_dirs:
-        if d and os.path.isdir(d):
-            for fn in os.listdir(d):
+def walk_find_db_files(search_roots, max_files=200):
+    found = []
+    seen = set()
+
+    for root in search_roots:
+        if not root or not os.path.exists(root):
+            continue
+        # 如果 root 本身是檔案
+        if os.path.isfile(root) and root.lower().endswith(".db"):
+            p = os.path.abspath(root)
+            if p not in seen:
+                found.append(p); seen.add(p)
+            continue
+
+        # 遞迴掃資料夾
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
                 if fn.lower().endswith(".db"):
-                    out.append(os.path.join(d, fn))
-    # 去重 + 排序
-    out = sorted(list(dict.fromkeys(out)))
-    return out
+                    p = os.path.abspath(os.path.join(dirpath, fn))
+                    if p not in seen:
+                        found.append(p); seen.add(p)
+                        if len(found) >= max_files:
+                            return sorted(found)
+    return sorted(found)
 
 def get_tables(conn):
     q = "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
     return [r[0] for r in conn.execute(q).fetchall()]
 
 def get_columns(conn, table):
-    # PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return [{"name": r[1], "type": r[2], "notnull": r[3], "pk": r[5]} for r in rows]
 
@@ -38,7 +50,7 @@ def read_head(conn, table, n):
 def make_ai_prompt(table, cols, sample_df):
     col_lines = "\n".join([f"- {c['name']} ({c['type']})" for c in cols])
     sample_csv = sample_df.to_csv(index=False)
-    return f"""你是一位資料工程/量化研究助理。請協助我理解 SQLite 資料表的欄位定義與用途，並檢查是否有缺欄、型別不一致或可疑資料品質問題。
+    return f"""你是一位資料工程/量化研究助理。請協助我理解 SQLite 資料表欄位定義與用途，並檢查是否有缺欄、型別不一致或可疑資料品質問題。
 
 【Table】{table}
 
@@ -49,8 +61,8 @@ def make_ai_prompt(table, cols, sample_df):
 {sample_csv}
 
 請輸出：
-1) 你對每個欄位的用途推測（中英文）
-2) 你覺得最可能需要補充/修正的欄位與理由
+1) 每個欄位用途推測（中英文）
+2) 最可能需要補充/修正的欄位與理由
 3) 建議我後續用哪些 SQL/查詢去驗證資料品質
 """
 
@@ -61,43 +73,64 @@ st.set_page_config(page_title="DB Check", layout="wide")
 st.title("🧪 DB Check（資料庫讀取 + Schema + Sample + 欄位字典 + AI Prompt）")
 st.caption("用途：確認 SQLite DB 可正常讀取、快速看到每個 table 的欄位與前 N 筆，並生成可直接貼去問 AI 的 prompt。")
 
-# 搜尋 db 的目錄：專案根目錄 + /tmp（Render/GHA 常用）
-search_dirs = [os.getcwd(), "/tmp"]
-db_files = list_db_files(search_dirs)
+cwd = os.getcwd()
 
-with st.expander("🔍 環境資訊 / DB 掃描", expanded=False):
-    st.write("當前目錄:", os.getcwd())
-    st.write("可掃描目錄:", search_dirs)
-    if db_files:
-        for p in db_files:
-            st.write(f"✅ {os.path.basename(p)} - {os.path.getsize(p):,} bytes - {p}")
-    else:
-        st.warning("找不到任何 .db 檔案。請先同步 DB 或確認 DB 落地路徑。")
+# 你在 Render 常見路徑：/opt/render/project/src（程式）+ /opt/render/project（上層）+ /tmp（暫存）
+search_roots = [
+    st.session_state.get("db_path", ""),  # 若其他頁面已設 db_path，優先放進來
+    cwd,
+    "/opt/render/project/src",
+    "/opt/render/project",
+    "/tmp",
+]
 
-if not db_files:
-    st.stop()
+with st.expander("🔍 環境資訊 / DB 掃描", expanded=True):
+    st.write("當前目錄:", cwd)
+    st.write("掃描 roots:", search_roots)
 
-# 預設挑 tw_stock_warehouse.db（如果存在）
-default_idx = 0
-for i, p in enumerate(db_files):
-    if os.path.basename(p) == "tw_stock_warehouse.db":
-        default_idx = i
-        break
+    # 額外：列出 cwd 檔案，讓你一眼看到 DB 到底有沒有在這層
+    try:
+        cwd_files = sorted(os.listdir(cwd))
+        st.write(f"cwd 檔案數: {len(cwd_files)}")
+        st.code("\n".join(cwd_files[:200]) + ("\n...(truncated)" if len(cwd_files) > 200 else ""))
+    except Exception as e:
+        st.warning(f"無法列出 cwd 檔案：{e}")
 
-db_path = st.selectbox(
-    "SQLite DB 路徑（自動掃描）",
-    db_files,
-    index=default_idx,
-)
+db_files = walk_find_db_files(search_roots)
 
-# 全站共用：寫入 session_state
-st.session_state["db_path"] = db_path
-st.session_state["db_name"] = os.path.basename(db_path)
+# 手動輸入路徑（超重要，救命用）
+manual_path = st.text_input("（可選）手動輸入 DB 絕對路徑", value="")
+
+# 如果手動輸入有效，直接用
+picked_db = None
+if manual_path and os.path.exists(manual_path) and manual_path.lower().endswith(".db"):
+    picked_db = os.path.abspath(manual_path)
+
+# 否則用掃描結果
+if picked_db is None:
+    if not db_files:
+        st.error("找不到任何 .db 檔案。👉 這代表 DB 不在掃描路徑內或同步其實沒落地到這個 container。")
+        st.info("建議：把你『同步 DB』那段程式下載的實際路徑 print 出來（或在同步後把 db_path 寫入 st.session_state['db_path']）。")
+        st.stop()
+
+    # 預設挑 tw_stock_warehouse.db
+    default_idx = 0
+    for i, p in enumerate(db_files):
+        if os.path.basename(p) == "tw_stock_warehouse.db":
+            default_idx = i
+            break
+
+    picked_db = st.selectbox("SQLite DB（遞迴掃描結果）", db_files, index=default_idx)
+
+# 全站共用
+st.session_state["db_path"] = picked_db
+st.session_state["db_name"] = os.path.basename(picked_db)
+
+st.success(f"✅ 使用 DB：{picked_db}")
 
 n_head = st.number_input("每表顯示前 N 筆", min_value=1, max_value=200, value=10, step=1)
 
-# 欄位字典（你可以慢慢擴充）
-# key: (table, column) -> {"zh": "...", "en": "...", "note": "..."}
+# 欄位字典（可慢慢擴充）
 COLUMN_DICT = {
     ("stock_prices", "symbol"): {"zh": "股票代號", "en": "Symbol/Ticker"},
     ("stock_prices", "date"): {"zh": "交易日期", "en": "Trading date"},
@@ -115,9 +148,7 @@ COLUMN_DICT = {
     ("stock_analysis", "strength_value"): {"zh": "強度數值化", "en": "Strength numeric value"},
 }
 
-# 讀 DB
-conn = sqlite3.connect(db_path, timeout=60)
-
+conn = sqlite3.connect(picked_db, timeout=60)
 try:
     tables = get_tables(conn)
     if not tables:
@@ -125,55 +156,36 @@ try:
         st.stop()
 
     st.subheader("📚 Tables")
-    cols = st.columns([2, 1, 1, 4])
-    with cols[0]:
-        table = st.selectbox("選擇 Table", tables, index=0)
-    with cols[1]:
-        show_schema = st.toggle("顯示欄位", value=True)
-    with cols[2]:
-        show_dict = st.toggle("顯示字典", value=True)
-    with cols[3]:
-        st.info("提示：你也可以用這頁生成 prompt，直接貼去問 AI 做資料品質檢查 / 欄位用途推測。")
+    table = st.selectbox("選擇 Table", tables, index=0)
 
-    # 基本資訊
     total = get_count(conn, table)
     st.write(f"**{table}** | rows: **{total:,}**")
 
-    # Schema
     cols_meta = get_columns(conn, table)
-    if show_schema:
-        schema_df = pd.DataFrame(cols_meta)
-        st.markdown("### 🧱 Schema")
-        st.dataframe(schema_df, use_container_width=True)
 
-    # Sample rows
+    st.markdown("### 🧱 Schema")
+    st.dataframe(pd.DataFrame(cols_meta), use_container_width=True)
+
     st.markdown("### 🔟 Sample (Top N rows)")
     sample_df = read_head(conn, table, n_head)
     st.dataframe(sample_df, use_container_width=True)
 
-    # Dictionary
-    if show_dict:
-        st.markdown("### 📖 欄位字典（中英文）")
-        dict_rows = []
-        for c in cols_meta:
-            key = (table, c["name"])
-            d = COLUMN_DICT.get(key, {})
-            dict_rows.append({
-                "column": c["name"],
-                "type": c["type"],
-                "zh": d.get("zh", ""),
-                "en": d.get("en", ""),
-                "note": d.get("note", ""),
-            })
-        dict_df = pd.DataFrame(dict_rows)
-        st.dataframe(dict_df, use_container_width=True)
+    st.markdown("### 📖 欄位字典（中英文）")
+    dict_rows = []
+    for c in cols_meta:
+        key = (table, c["name"])
+        d = COLUMN_DICT.get(key, {})
+        dict_rows.append({
+            "column": c["name"],
+            "type": c["type"],
+            "zh": d.get("zh", ""),
+            "en": d.get("en", ""),
+            "note": d.get("note", ""),
+        })
+    st.dataframe(pd.DataFrame(dict_rows), use_container_width=True)
 
-        st.caption("✅ 這份字典你可以逐步補齊（新增到 COLUMN_DICT）。")
-
-    # AI Prompt
     st.markdown("### 🤖 一鍵生成「可貼去問 AI」的 Prompt")
-    prompt = make_ai_prompt(table, cols_meta, sample_df)
-    st.text_area("Prompt（可直接複製）", prompt, height=260)
+    st.text_area("Prompt（可直接複製）", make_ai_prompt(table, cols_meta, sample_df), height=260)
 
 finally:
     conn.close()
