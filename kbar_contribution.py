@@ -304,14 +304,15 @@ def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) 
         # 市場過濾（可選）
         if only_markets:
             if "stock_info" not in existing:
-                raise RuntimeError("你傳了 only_markets 但 DB 沒有 stock_info 表，無法過濾市場")
-            info = pd.read_sql("SELECT symbol, market FROM stock_info", conn)
-            y = y.merge(info, on="symbol", how="left")
-            y = y[y["market"].str.lower().isin(set([m.lower() for m in only_markets]))].copy()
-            y = y.drop(columns=["market"], errors="ignore")
-            if y.empty:
-                print("❌ only_markets 過濾後 kbar_yearly 無資料")
-                return {"year_rows": 0, "bin_rows": 0}
+                print("⚠️ 你傳了 only_markets，但 DB 沒有 stock_info 表；將略過市場過濾。")
+            else:
+                info = pd.read_sql("SELECT symbol, market FROM stock_info", conn)
+                y = y.merge(info, on="symbol", how="left")
+                y = y[y["market"].str.lower().isin(set([m.lower() for m in only_markets]))].copy()
+                y = y.drop(columns=["market"], errors="ignore")
+                if y.empty:
+                    print("❌ only_markets 過濾後 kbar_yearly 無資料")
+                    return {"year_rows": 0, "bin_rows": 0}
 
         y["period_start"] = pd.to_datetime(y["period_start"], errors="coerce")
         y["period_end"] = pd.to_datetime(y["period_end"], errors="coerce")
