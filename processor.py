@@ -335,6 +335,23 @@ def process_market_data(db_path: str):
         group["vol_ma5"] = group["volume"].rolling(window=5, min_periods=1).mean()
         group["year"] = group["date"].dt.year
 
+# --- 開盤型態中間欄位（可解釋、可調參） ---
+# gap_pct = Open / Prev_Close - 1
+safe_prev = group["prev_close"].replace(0, np.nan)
+group["gap_pct"] = (group["open"].astype(float) / safe_prev - 1.0).astype(float)
+group["is_gap_up"] = (group["gap_pct"] >= 0.07).astype(int)
+
+# vol_ratio = Volume / Vol_MA5
+safe_vol_ma5 = group["vol_ma5"].replace(0, np.nan)
+group["vol_ratio"] = (group["volume"].astype(float) / safe_vol_ma5).astype(float)
+group["is_high_volume"] = (group["vol_ratio"] >= 3.0).astype(int)
+group["is_low_volume"] = (group["vol_ratio"] <= 0.4).astype(int)
+
+# floating push: 非 gap 且 Close/Open - 1 >= 0.05
+safe_open = group["open"].replace(0, np.nan)
+group["float_push_pct"] = (group["close"].astype(float) / safe_open - 1.0).astype(float)
+group["is_floating_push"] = ((group["is_gap_up"] == 0) & (group["float_push_pct"] >= 0.05)).astype(int)
+
         # --- 漲幅百分比 ---
         change_pct = (group["daily_change"] * 100).astype(float)
 
@@ -408,6 +425,8 @@ def process_market_data(db_path: str):
             volume=group["volume"].astype(float),
             vol_ma5=group["vol_ma5"].astype(float),
         )
+
+        group["limitup_open_type"] = group["lu_type"]
 
         # --- 連板次數 ---
         group["consecutive_limits"] = _compute_consecutive_limits(group["is_limit_up"]).astype(int)
