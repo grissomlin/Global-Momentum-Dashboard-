@@ -365,3 +365,8 @@ def build_kbar_tables(
 
     conn.close()
     return (len(wk), len(mk), len(yk))
+
+# Backward compatible alias (main.py expects build_kbars)
+def build_kbars(db_path: str):
+    """Alias for main.py compatibility."""
+    return build_kbar_tables(db_path)
