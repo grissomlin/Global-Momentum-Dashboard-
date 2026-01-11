@@ -41,17 +41,6 @@ except Exception:
 
 
 # =============================================================================
-# 0.5) 匯入資料清洗工具（可選）
-# =============================================================================
-try:
-    from data_cleaning import clean_pingpong_daily
-    HAS_DATA_CLEANING = True
-except Exception:
-    clean_pingpong_daily = None
-    HAS_DATA_CLEANING = False
-
-
-# =============================================================================
 # 1) Fallback 規則（只有當 market_rules.py 不存在時才用）
 # =============================================================================
 def _fallback_get_rule(market: str, market_detail: str, symbol: str) -> dict:
@@ -147,41 +136,6 @@ def _strength_value_from_rank(rank: pd.Series) -> pd.Series:
     return rank.apply(_v)
 
 
-
-def _drop_non_trading_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """移除明顯非交易(或資料缺失)的列：volume=0 且 OHLC 全等。
-    這類資料常見於停牌/資料源補值/抓價失敗，會污染技術指標與一字鎖判定。
-    """
-    needed = {"open","high","low","close","volume"}
-    if not needed.issubset(df.columns):
-        return df
-    vol0 = pd.to_numeric(df["volume"], errors="coerce").fillna(0) <= 0
-    o = pd.to_numeric(df["open"], errors="coerce")
-    h = pd.to_numeric(df["high"], errors="coerce")
-    l = pd.to_numeric(df["low"], errors="coerce")
-    c = pd.to_numeric(df["close"], errors="coerce")
-    ohlc_same = (o == h) & (h == l) & (l == c)
-    # 只在「完全沒量」且「OHLC 全等」才判斷為非交易列
-    mask = vol0 & ohlc_same
-    if mask.any():
-        df = df.loc[~mask].copy()
-    return df
-
-
-def _normalize_text_nulls(s: pd.Series) -> pd.Series:
-    """把 pandas NaN 或 'nan'/'None'/空字串 轉成真正的 NULL(None)，避免寫回 SQLite 變成字串。"""
-    if s is None:
-        return s
-    out = s.copy()
-    # 先把 numpy.nan 變 None
-    out = out.where(~out.isna(), None)
-    # 再把字串型的 nan/none/空字串 變 None
-    if out.dtype == object:
-        tmp = out.astype(str)
-        bad = tmp.str.strip().str.lower().isin(["nan","none",""])
-        out = out.mask(bad, None)
-    return out
-
 def _compute_consecutive_limits(is_limit_up: pd.Series) -> pd.Series:
     """
     連板：只在 is_limit_up==1 時計算連續天數，其他為 0
@@ -249,6 +203,20 @@ def _compute_lu_type_article_style(
 # =============================================================================
 # 3) 主流程
 # =============================================================================
+
+
+def _forward_window_extreme(s: pd.Series, start: int, end: int, extreme: str) -> pd.Series:
+    """Forward window extreme aligned at t: extreme over s[t+start ... t+end].
+    extreme: 'max' or 'min'
+    """
+    w = end - start + 1
+    shifted = s.shift(-start)
+    if extreme == "max":
+        out = shifted.rolling(window=w, min_periods=w).max()
+    else:
+        out = shifted.rolling(window=w, min_periods=w).min()
+    return out.shift(-(w - 1))
+
 def process_market_data(db_path: str):
     conn = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT)
 
@@ -294,31 +262,6 @@ def process_market_data(db_path: str):
         if len(group) < 40:
             continue
 
-        # -------------------------
-        # (可選) 日K 乒乓/錯價清洗
-        # -------------------------
-        if HAS_DATA_CLEANING and clean_pingpong_daily is not None:
-            try:
-                group = clean_pingpong_daily(
-                    group,
-                    threshold=0.40,
-                    abs_cap=0.80,
-                    date_col="date",
-                    price_col="close",
-                    recompute_prev_close=False,
-                    recompute_daily_change=False,
-                )
-            except Exception:
-                # 清洗失敗不阻塞主流程
-                pass
-
-        # 移除明顯非交易列（volume=0 且 OHLC 全等）
-        group = _drop_non_trading_rows(group)
-
-        # 清洗後長度不足就跳過
-        if len(group) < 40:
-            continue
-
         market = str(group["market"].iloc[0]) if "market" in group.columns else ""
         market_detail = str(group["market_detail"].iloc[0]) if "market_detail" in group.columns else ""
 
@@ -333,24 +276,26 @@ def process_market_data(db_path: str):
         group["daily_change"] = group["close"].pct_change()
         group["avg_vol_20"] = group["volume"].rolling(window=20, min_periods=1).mean()
         group["vol_ma5"] = group["volume"].rolling(window=5, min_periods=1).mean()
+        # --- 量能比（相對 5 日均量）& 分層（for 隔日沖/派發研究） ---
+        group["vol_ratio"] = (group["volume"].astype(float) / group["vol_ma5"].replace(0, np.nan).astype(float)).astype(float)
+        group["is_high_volume"] = (group["vol_ratio"] >= 3.0).astype(int)
+        group["is_medium_volume"] = ((group["vol_ratio"] >= 1.5) & (group["vol_ratio"] < 3.0)).astype(int)
+        group["is_low_volume"] = (group["vol_ratio"] < 1.0).astype(int)
+
+        def _vol_level(v):
+            if pd.isna(v):
+                return None
+            if v >= 3.0:
+                return "HV"
+            if v >= 1.5:
+                return "MV"
+            if v < 1.0:
+                return "LV"
+            return "NV"
+
+        group["vol_level"] = group["vol_ratio"].apply(_vol_level)
+
         group["year"] = group["date"].dt.year
-
-# --- 開盤型態中間欄位（可解釋、可調參） ---
-# gap_pct = Open / Prev_Close - 1
-safe_prev = group["prev_close"].replace(0, np.nan)
-group["gap_pct"] = (group["open"].astype(float) / safe_prev - 1.0).astype(float)
-group["is_gap_up"] = (group["gap_pct"] >= 0.07).astype(int)
-
-# vol_ratio = Volume / Vol_MA5
-safe_vol_ma5 = group["vol_ma5"].replace(0, np.nan)
-group["vol_ratio"] = (group["volume"].astype(float) / safe_vol_ma5).astype(float)
-group["is_high_volume"] = (group["vol_ratio"] >= 3.0).astype(int)
-group["is_low_volume"] = (group["vol_ratio"] <= 0.4).astype(int)
-
-# floating push: 非 gap 且 Close/Open - 1 >= 0.05
-safe_open = group["open"].replace(0, np.nan)
-group["float_push_pct"] = (group["close"].astype(float) / safe_open - 1.0).astype(float)
-group["is_floating_push"] = ((group["is_gap_up"] == 0) & (group["float_push_pct"] >= 0.05)).astype(int)
 
         # --- 漲幅百分比 ---
         change_pct = (group["daily_change"] * 100).astype(float)
@@ -374,6 +319,8 @@ group["is_floating_push"] = ((group["is_gap_up"] == 0) & (group["float_push_pct"
         limit_up_pct = rule.get("limit_up_pct", None)
 
         # market_rules 精準版（TW tick / JP 値幅制限）
+        limit_price = None
+        buffer = 0.0
         used_precise = False
         if HAS_MARKET_RULES and hasattr(market_rules, "calc_limit_up_price"):
             try:
@@ -406,9 +353,59 @@ group["is_floating_push"] = ((group["is_gap_up"] == 0) & (group["float_push_pct"
         if synth is not None and group["is_limit_up"].sum() == 0:
             group["is_limit_up"] = (group["daily_change"].astype(float) >= float(synth)).astype(int)
 
+
+        # --- 方便除錯：保存今日漲停價（若可計算） ---
+        group["limit_up_price"] = pd.to_numeric(limit_price, errors="coerce") if limit_price is not None else np.nan
+        group["limit_up_buffer"] = buffer if isinstance(buffer, (int, float)) else pd.to_numeric(buffer, errors="coerce")
+
+        # --- 盤中觸及漲停 / 觸及未鎖 ---
+        if limit_price is not None:
+            lp = pd.to_numeric(limit_price, errors="coerce")
+            buf = buffer if isinstance(buffer, (int, float)) else pd.to_numeric(buffer, errors="coerce").fillna(0)
+            group["hit_limit_up_intraday"] = (group["high"].astype(float) >= (lp.astype(float) - buf)).astype(int)
+        else:
+            group["hit_limit_up_intraday"] = 0
+
+        group["close_limit_up"] = group["is_limit_up"].astype(int)
+        group["hit_but_failed_limit_up"] = ((group["hit_limit_up_intraday"] == 1) & (group["close_limit_up"] == 0)).astype(int)
+
+        # --- 開盤接近漲停價（例如距離≤0.5%） ---
+        # 定義：若能算出當日漲停價 limit_up_price，且 open 與漲停價距離在 0.5% 以內（通常是略低於漲停價），則為 1。
+        # 註：台股漲停價會有跳動單位/四捨五入，limit_up_buffer 可用於放寬一點點的比較。
+        if limit_price is not None:
+            lp = pd.to_numeric(limit_price, errors="coerce").astype(float)
+            op = group["open"].astype(float)
+            buf = group["limit_up_buffer"].fillna(0).astype(float)
+
+            # 以「低於或接近漲停價」為主：距離 = max(lp - open, 0) / lp
+            dist = (lp - op).clip(lower=0) / lp.replace(0, np.nan)
+            group["open_near_limit_up"] = ((dist <= 0.005) | (op >= (lp - buf))).astype(int)
+        else:
+            group["open_near_limit_up"] = 0
+
+        # --- 上影線 ---
+        group["_max_oc"] = np.maximum(group["open"].astype(float), group["close"].astype(float))
+        group["upper_shadow"] = (group["high"].astype(float) - group["_max_oc"]).clip(lower=0)
+        group["real_body"] = (group["close"].astype(float) - group["open"].astype(float)).abs()
+        group["upper_shadow_pct"] = (group["upper_shadow"] / group["close"].replace(0, np.nan).astype(float)).astype(float)
+        group["upper_shadow_body_ratio"] = (group["upper_shadow"] / (group["real_body"] + 1e-9)).astype(float)
+        group["has_upper_shadow"] = ((group["upper_shadow_pct"] >= 0.02) | (group["upper_shadow_body_ratio"] >= 1.5)).astype(int)
+
+        # --- 長黑 ---
+        group["is_black_candle"] = (group["close"].astype(float) < group["open"].astype(float)).astype(int)
+        group["real_body_pct"] = (group["real_body"] / group["open"].replace(0, np.nan).astype(float)).astype(float)
+        group["is_long_black"] = ((group["is_black_candle"] == 1) & (group["real_body_pct"] >= 0.03)).astype(int)
+
+        # --- 事件型態加強（隔日沖常見形態） ---
+        # 1) 高開 + 長黑：隔日高開後一路被倒貨
+        group["gap_up_and_long_black"] = ((group.get("is_gap_up", 0).astype(int) == 1) & (group["is_long_black"].astype(int) == 1)).astype(int)
+
+        # 2) 盤中碰板 + 長黑：先衝到漲停（或接近）再被砍成長黑
+        group["hit_limitup_intraday_and_long_black"] = ((group["hit_limit_up_intraday"].astype(int) == 1) & (group["is_long_black"].astype(int) == 1)).astype(int)
+
+        group.drop(columns=["_max_oc"], inplace=True, errors="ignore")
         # --- 一字鎖 ---
         group["is_one_tick_lock"] = (
-            (pd.to_numeric(group["volume"], errors="coerce").fillna(0) > 0) &
             (group["open"] == group["close"]) &
             (group["high"] == group["low"]) &
             (group["high"] == group["close"])
@@ -425,8 +422,6 @@ group["is_floating_push"] = ((group["is_gap_up"] == 0) & (group["float_push_pct"
             volume=group["volume"].astype(float),
             vol_ma5=group["vol_ma5"].astype(float),
         )
-
-        group["limitup_open_type"] = group["lu_type"]
 
         # --- 連板次數 ---
         group["consecutive_limits"] = _compute_consecutive_limits(group["is_limit_up"]).astype(int)
@@ -528,6 +523,74 @@ group["is_floating_push"] = ((group["is_gap_up"] == 0) & (group["float_push_pct"
         group["year_start_price"] = group["year"].map(year_to_start)
         group["ytd_ret"] = ((group["close"] - group["year_start_price"]) / group["year_start_price"] * 100).round(2)
 
+
+        # --- T-1 漲停/連板狀態 ---
+        group["prev_day_limit_up"] = group["is_limit_up"].shift(1).fillna(0).astype(int)
+        group["prev_consecutive_limits"] = group["consecutive_limits"].shift(1).fillna(0).astype(int)
+
+        # --- 隔日資料（T+1） ---
+        group["next_open"] = group["open"].shift(-1)
+        group["next_high"] = group["high"].shift(-1)
+        group["next_low"] = group["low"].shift(-1)
+        group["next_close"] = group["close"].shift(-1)
+        group["next_volume"] = group["volume"].shift(-1)
+
+        # --- 隔日報酬（以事件日 close 為基準） ---
+        base_close = group["close"].replace(0, np.nan).astype(float)
+        group["D1_open_ret"] = (group["next_open"].astype(float) / base_close - 1).astype(float)
+        group["D1_close_ret"] = (group["next_close"].astype(float) / base_close - 1).astype(float)
+        group["D1_high_ret"] = (group["next_high"].astype(float) / base_close - 1).astype(float)
+
+        # --- 隔日沖標籤（可調門檻） ---
+        HI_TH = 0.03   # 隔日盤中最高達到 +3%
+        GAP_TH = 0.03  # 隔日高開 +3%
+        group["is_daytrade_fail"] = ((group["D1_high_ret"] >= HI_TH) & (group["D1_close_ret"] <= 0)).astype(int)
+        group["is_gap_fade"] = ((group["D1_open_ret"] >= GAP_TH) & (group["next_close"].astype(float) < group["next_open"].astype(float))).astype(int)
+
+        # --- 事件：昨天漲停 → 今天（碰板未鎖+上影線）/（長黑） ---
+        group["post_lu_hit_fail_upper"] = (
+            (group["prev_day_limit_up"] == 1) &
+            (group["hit_but_failed_limit_up"] == 1) &
+            (group["has_upper_shadow"] == 1)
+        ).astype(int)
+
+        group["post_lu_long_black"] = (
+            (group["prev_day_limit_up"] == 1) &
+            (group["is_long_black"] == 1)
+        ).astype(int)
+
+        # 連板後事件（>=2 連後）
+        group["post_streak_hit_fail_upper"] = (
+            (group["prev_consecutive_limits"] >= 2) &
+            (group["post_lu_hit_fail_upper"] == 1)
+        ).astype(int)
+
+        group["post_streak_long_black"] = (
+            (group["prev_consecutive_limits"] >= 2) &
+            (group["post_lu_long_black"] == 1)
+        ).astype(int)
+
+        # --- Forward windows：1-5 / 6-10 / 11-20 / 6-20 最大漲跌幅（以事件日 close 為基準） ---
+        max_high_1_5 = _forward_window_extreme(group["high"].astype(float), 1, 5, "max")
+        min_low_1_5 = _forward_window_extreme(group["low"].astype(float), 1, 5, "min")
+        max_high_6_10 = _forward_window_extreme(group["high"].astype(float), 6, 10, "max")
+        min_low_6_10 = _forward_window_extreme(group["low"].astype(float), 6, 10, "min")
+        max_high_11_20 = _forward_window_extreme(group["high"].astype(float), 11, 20, "max")
+        min_low_11_20 = _forward_window_extreme(group["low"].astype(float), 11, 20, "min")
+        max_high_6_20 = _forward_window_extreme(group["high"].astype(float), 6, 20, "max")
+        min_low_6_20 = _forward_window_extreme(group["low"].astype(float), 6, 20, "min")
+
+        group["max_ret_1_5d"] = (max_high_1_5 / base_close - 1).astype(float)
+        group["min_ret_1_5d"] = (min_low_1_5 / base_close - 1).astype(float)
+
+        group["max_ret_6_10d"] = (max_high_6_10 / base_close - 1).astype(float)
+        group["min_ret_6_10d"] = (min_low_6_10 / base_close - 1).astype(float)
+
+        group["max_ret_11_20d"] = (max_high_11_20 / base_close - 1).astype(float)
+        group["min_ret_11_20d"] = (min_low_11_20 / base_close - 1).astype(float)
+
+        group["max_ret_6_20d"] = (max_high_6_20 / base_close - 1).astype(float)
+        group["min_ret_6_20d"] = (min_low_6_20 / base_close - 1).astype(float)
         processed_list.append(group)
 
     if not processed_list:
@@ -536,12 +599,6 @@ group["is_floating_push"] = ((group["is_gap_up"] == 0) & (group["float_push_pct"
         return
 
     df_final = pd.concat(processed_list, ignore_index=True)
-
-    
-    # --- 文字欄位 NULL 正規化：避免把 NaN 寫成字串 'nan' ---
-    for _col in ["market", "sector", "market_detail", "strength_rank", "lu_type"]:
-        if _col in df_final.columns:
-            df_final[_col] = _normalize_text_nulls(df_final[_col])
 
     # 日期轉文字（SQLite 寫入穩定）
     df_final["date"] = pd.to_datetime(df_final["date"]).dt.strftime("%Y-%m-%d")
