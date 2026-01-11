@@ -397,11 +397,21 @@ def process_market_data(db_path: str):
         group["is_long_black"] = ((group["is_black_candle"] == 1) & (group["real_body_pct"] >= 0.03)).astype(int)
 
         # --- 事件型態加強（隔日沖常見形態） ---
+        # helper: ensure missing columns become aligned Series (avoid int .astype crash)
+        def _series_int(_df, _col, _default=0):
+            if _col in _df.columns:
+                return pd.to_numeric(_df[_col], errors="coerce").fillna(_default).astype(int)
+            return pd.Series(_default, index=_df.index, dtype="int64")
+
         # 1) 高開 + 長黑：隔日高開後一路被倒貨
-        group["gap_up_and_long_black"] = ((group.get("is_gap_up", 0).astype(int) == 1) & (group["is_long_black"].astype(int) == 1)).astype(int)
+        is_gap_up_s = _series_int(group, "is_gap_up", 0)
+        is_long_black_s = _series_int(group, "is_long_black", 0)
+        group["gap_up_and_long_black"] = ((is_gap_up_s == 1) & (is_long_black_s == 1)).astype(int)
 
         # 2) 盤中碰板 + 長黑：先衝到漲停（或接近）再被砍成長黑
-        group["hit_limitup_intraday_and_long_black"] = ((group["hit_limit_up_intraday"].astype(int) == 1) & (group["is_long_black"].astype(int) == 1)).astype(int)
+        hit_lu_s = _series_int(group, "hit_limit_up_intraday", 0)
+        group["hit_limitup_intraday_and_long_black"] = ((hit_lu_s == 1) & (is_long_black_s == 1)).astype(int)
+
 
         group.drop(columns=["_max_oc"], inplace=True, errors="ignore")
         # --- 一字鎖 ---
