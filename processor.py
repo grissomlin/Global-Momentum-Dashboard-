@@ -41,6 +41,17 @@ except Exception:
 
 
 # =============================================================================
+# 0.5) 匯入資料清洗工具（可選）
+# =============================================================================
+try:
+    from data_cleaning import clean_pingpong_daily
+    HAS_DATA_CLEANING = True
+except Exception:
+    clean_pingpong_daily = None
+    HAS_DATA_CLEANING = False
+
+
+# =============================================================================
 # 1) Fallback 規則（只有當 market_rules.py 不存在時才用）
 # =============================================================================
 def _fallback_get_rule(market: str, market_detail: str, symbol: str) -> dict:
@@ -135,6 +146,41 @@ def _strength_value_from_rank(rank: pd.Series) -> pd.Series:
 
     return rank.apply(_v)
 
+
+
+def _drop_non_trading_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """移除明顯非交易(或資料缺失)的列：volume=0 且 OHLC 全等。
+    這類資料常見於停牌/資料源補值/抓價失敗，會污染技術指標與一字鎖判定。
+    """
+    needed = {"open","high","low","close","volume"}
+    if not needed.issubset(df.columns):
+        return df
+    vol0 = pd.to_numeric(df["volume"], errors="coerce").fillna(0) <= 0
+    o = pd.to_numeric(df["open"], errors="coerce")
+    h = pd.to_numeric(df["high"], errors="coerce")
+    l = pd.to_numeric(df["low"], errors="coerce")
+    c = pd.to_numeric(df["close"], errors="coerce")
+    ohlc_same = (o == h) & (h == l) & (l == c)
+    # 只在「完全沒量」且「OHLC 全等」才判斷為非交易列
+    mask = vol0 & ohlc_same
+    if mask.any():
+        df = df.loc[~mask].copy()
+    return df
+
+
+def _normalize_text_nulls(s: pd.Series) -> pd.Series:
+    """把 pandas NaN 或 'nan'/'None'/空字串 轉成真正的 NULL(None)，避免寫回 SQLite 變成字串。"""
+    if s is None:
+        return s
+    out = s.copy()
+    # 先把 numpy.nan 變 None
+    out = out.where(~out.isna(), None)
+    # 再把字串型的 nan/none/空字串 變 None
+    if out.dtype == object:
+        tmp = out.astype(str)
+        bad = tmp.str.strip().str.lower().isin(["nan","none",""])
+        out = out.mask(bad, None)
+    return out
 
 def _compute_consecutive_limits(is_limit_up: pd.Series) -> pd.Series:
     """
@@ -248,6 +294,31 @@ def process_market_data(db_path: str):
         if len(group) < 40:
             continue
 
+        # -------------------------
+        # (可選) 日K 乒乓/錯價清洗
+        # -------------------------
+        if HAS_DATA_CLEANING and clean_pingpong_daily is not None:
+            try:
+                group = clean_pingpong_daily(
+                    group,
+                    threshold=0.40,
+                    abs_cap=0.80,
+                    date_col="date",
+                    price_col="close",
+                    recompute_prev_close=False,
+                    recompute_daily_change=False,
+                )
+            except Exception:
+                # 清洗失敗不阻塞主流程
+                pass
+
+        # 移除明顯非交易列（volume=0 且 OHLC 全等）
+        group = _drop_non_trading_rows(group)
+
+        # 清洗後長度不足就跳過
+        if len(group) < 40:
+            continue
+
         market = str(group["market"].iloc[0]) if "market" in group.columns else ""
         market_detail = str(group["market_detail"].iloc[0]) if "market_detail" in group.columns else ""
 
@@ -320,6 +391,7 @@ def process_market_data(db_path: str):
 
         # --- 一字鎖 ---
         group["is_one_tick_lock"] = (
+            (pd.to_numeric(group["volume"], errors="coerce").fillna(0) > 0) &
             (group["open"] == group["close"]) &
             (group["high"] == group["low"]) &
             (group["high"] == group["close"])
@@ -446,7 +518,13 @@ def process_market_data(db_path: str):
 
     df_final = pd.concat(processed_list, ignore_index=True)
 
-    # 日期轉文字（SQLite 寫入穩定）
+    
+# --- 文字欄位 NULL 正規化：避免把 NaN 寫成字串 'nan' ---
+for _col in ["market", "sector", "market_detail", "strength_rank", "lu_type"]:
+    if _col in df_final.columns:
+        df_final[_col] = _normalize_text_nulls(df_final[_col])
+
+# 日期轉文字（SQLite 寫入穩定）
     df_final["date"] = pd.to_datetime(df_final["date"]).dt.strftime("%Y-%m-%d")
     if "peak_date" in df_final.columns:
         df_final["peak_date"] = pd.to_datetime(df_final["peak_date"], errors="coerce").dt.strftime("%Y-%m-%d")
