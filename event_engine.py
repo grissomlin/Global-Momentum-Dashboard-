@@ -332,6 +332,7 @@ def build_event_tables(db_path: str, only_markets: Iterable[str] = ("tw", "cn", 
 
         if "is_one_tick_lock" not in base.columns:
             base["is_one_tick_lock"] = (
+                (base["volume"].fillna(0) > 0) &
                 (base["open"] == base["close"]) &
                 (base["high"] == base["low"]) &
                 (base["high"] == base["close"])
@@ -447,11 +448,59 @@ def build_event_tables(db_path: str, only_markets: Iterable[str] = ("tw", "cn", 
         lu_events.to_sql("limit_up_events", conn, if_exists="replace", index=False)
         daytrade_events.to_sql("daytrade_events", conn, if_exists="replace", index=False)
 
+        # =========================
+        # C) limit_up summaries（給 dashboard/pages 秒開用）
+        # =========================
+        # 1) Daily summary（整體市場層級）
+        if not lu_events.empty:
+            tmp = lu_events.copy()
+            tmp["date"] = pd.to_datetime(tmp["date"]).dt.strftime("%Y-%m-%d")
+            # 防呆：sector 可能空
+            tmp["sector"] = tmp.get("sector", None)
+            daily_summary = (
+                tmp.groupby(["date", "market"], dropna=False)
+                .agg(
+                    limitup_count=("symbol", "count"),
+                    one_tick_count=("is_one_tick_lock", "sum") if "is_one_tick_lock" in tmp.columns else ("symbol", "size"),
+                    fail_count=("limit_up_fail", "sum") if "limit_up_fail" in tmp.columns else ("symbol", "size"),
+                    intraday_hit_count=("hit_limit_up_intraday", "sum") if "hit_limit_up_intraday" in tmp.columns else ("symbol", "size"),
+                    avg_consecutive=("consecutive_limits", "mean") if "consecutive_limits" in tmp.columns else ("symbol", "size"),
+                    median_consecutive=("consecutive_limits", "median") if "consecutive_limits" in tmp.columns else ("symbol", "size"),
+                )
+                .reset_index()
+            )
+            # 2) Sector daily summary（市場+產業層級）
+            sector_daily = (
+                tmp.groupby(["date", "market", "sector"], dropna=False)
+                .agg(
+                    limitup_count=("symbol", "count"),
+                    one_tick_count=("is_one_tick_lock", "sum") if "is_one_tick_lock" in tmp.columns else ("symbol", "size"),
+                    avg_consecutive=("consecutive_limits", "mean") if "consecutive_limits" in tmp.columns else ("symbol", "size"),
+                    median_consecutive=("consecutive_limits", "median") if "consecutive_limits" in tmp.columns else ("symbol", "size"),
+                )
+                .reset_index()
+            )
+
+            conn.execute("DROP TABLE IF EXISTS limit_up_daily_summary")
+            conn.execute("DROP TABLE IF EXISTS limit_up_sector_daily")
+            daily_summary.to_sql("limit_up_daily_summary", conn, if_exists="replace", index=False)
+            sector_daily.to_sql("limit_up_sector_daily", conn, if_exists="replace", index=False)
+
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_luds_date_market ON limit_up_daily_summary(date, market)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_lusd_date_market_sector ON limit_up_sector_daily(date, market, sector)")
+            except Exception:
+                pass
+
+
         # index（加速查詢）
         try:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_lu_symbol_date ON limit_up_events(symbol, date)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_lu_market ON limit_up_events(market)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_lu_lu_type ON limit_up_events(lu_type)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_lu_date ON limit_up_events(date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_lu_sector_date ON limit_up_events(sector, date)")
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dt_symbol_date ON daytrade_events(symbol, date)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dt_flags ON daytrade_events(prev_limit_up_today_not, today_limit_up_fail_no_prev)")
         except Exception:
