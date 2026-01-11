@@ -519,12 +519,12 @@ def process_market_data(db_path: str):
     df_final = pd.concat(processed_list, ignore_index=True)
 
     
-# --- 文字欄位 NULL 正規化：避免把 NaN 寫成字串 'nan' ---
-for _col in ["market", "sector", "market_detail", "strength_rank", "lu_type"]:
-    if _col in df_final.columns:
-        df_final[_col] = _normalize_text_nulls(df_final[_col])
+    # --- 文字欄位 NULL 正規化：避免把 NaN 寫成字串 'nan' ---
+    for _col in ["market", "sector", "market_detail", "strength_rank", "lu_type"]:
+        if _col in df_final.columns:
+            df_final[_col] = _normalize_text_nulls(df_final[_col])
 
-# 日期轉文字（SQLite 寫入穩定）
+    # 日期轉文字（SQLite 寫入穩定）
     df_final["date"] = pd.to_datetime(df_final["date"]).dt.strftime("%Y-%m-%d")
     if "peak_date" in df_final.columns:
         df_final["peak_date"] = pd.to_datetime(df_final["peak_date"], errors="coerce").dt.strftime("%Y-%m-%d")
