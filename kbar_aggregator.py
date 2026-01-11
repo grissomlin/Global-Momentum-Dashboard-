@@ -1,519 +1,367 @@
-# kbar_contribution.py
+# kbar_aggregator.py
 # -*- coding: utf-8 -*-
 """
-kbar_contribution.py  (精準切段版｜都來｜不刪舊功能，只加)
------------------------------------------------
-依賴：
-- kbar_aggregator.py -> kbar_weekly / kbar_monthly / kbar_yearly
-- processor.py -> stock_analysis（需 open/close/prev_close/is_limit_up）
+kbar_aggregator.py
+------------------
+從 SQLite 的 stock_prices 聚合出：
+- kbar_weekly
+- kbar_monthly
+- kbar_yearly
 
-輸出：
-- year_contribution
-- year_contribution_bins
+設計重點：
+- 只負責「聚合 + 寫回 DB」，不做 UI、不做事件研究。
+- 在聚合前可選擇套用 data_cleaning.clean_pingpong_daily()，避免單根錯價污染週K/月K/年K。
+- 週K以 W-FRI（週五收）為週期；若遇到市場不同週期需求，可改 build_weekly() 內的 freq。
 
-新增（你說「都來」）：
-- burst_style_week / burst_style_month：
-    * ONE_WEEK_BURST  : top1_week_share_net >= 0.5
-    * ONE_MONTH_BURST : top1_month_share_net >= 0.5
+需求（至少要存在）：
+- stock_prices(symbol, date, open, high, low, close, volume)
+可選：
+- stock_info(symbol, market, market_detail, sector)  (目前聚合表不強依賴，但可擴充寫入 market/sector)
+
+輸出表欄位（最小集合，供 kbar_contribution.py 使用）：
+- kbar_weekly : symbol, year, week_id, period_start, period_end, open, high, low, close, volume
+- kbar_monthly: symbol, year, month_id, period_start, period_end, open, high, low, close, volume
+- kbar_yearly : symbol, year, period_start, period_end, open, high, low, close, volume, year_peak_date, year_peak_high
 """
 
-import sys
+from __future__ import annotations
+
 import sqlite3
+from typing import Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict
 
-SQLITE_TIMEOUT = 120
-
-
-# -----------------------------------------------------------------------------
-# bins
-# -----------------------------------------------------------------------------
-def _bin_year_ret_100(ret_pct: float) -> str:
-    if not np.isfinite(ret_pct):
-        return "NA"
-    if ret_pct < 0:
-        return "NEGATIVE"
-    if ret_pct >= 1000:
-        return "1000UP"
-    lo = int(ret_pct // 100) * 100
-    hi = lo + 100
-    return f"{lo:04d}-{hi:04d}"
-
-
-def _bin_year_ret_10_under100(ret_pct: float) -> str:
-    if not np.isfinite(ret_pct):
-        return "NA"
-    if ret_pct < 0:
-        return "NEGATIVE"
-    if ret_pct >= 100:
-        return "GE_100"
-    lo = int(ret_pct // 10) * 10
-    hi = lo + 10
-    return f"{lo:02d}-{hi:02d}"
-
-
-def _bin_year_ret_50_under100(ret_pct: float) -> str:
-    if not np.isfinite(ret_pct):
-        return "NA"
-    if ret_pct < 0:
-        return "NEGATIVE"
-    if ret_pct < 50:
-        return "00-50"
-    if ret_pct < 100:
-        return "50-100"
-    return "100UP"
+# 清洗模組（可用/不可用都不阻塞）
+try:
+    from data_cleaning import clean_pingpong_daily  # type: ignore
+    CLEANING_AVAILABLE = True
+except Exception:
+    clean_pingpong_daily = None  # type: ignore
+    CLEANING_AVAILABLE = False
 
 
 # -----------------------------------------------------------------------------
-# math helpers
+# Helpers
 # -----------------------------------------------------------------------------
-def _safe_log_ratio(a: float, b: float) -> float:
-    if not np.isfinite(a) or not np.isfinite(b):
-        return 0.0
-    if a <= 0 or b <= 0:
-        return 0.0
-    return float(np.log(a / b))
+def _connect(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA cache_size=-200000;")  # ~200MB
+    return conn
 
 
-def _topk_share_pos(period_logrets: np.ndarray, denom: float, k: int) -> float:
-    if denom <= 0 or period_logrets.size == 0:
-        return 0.0
-    pos = period_logrets[np.isfinite(period_logrets) & (period_logrets > 0)]
-    if pos.size == 0:
-        return 0.0
-    pos_sorted = np.sort(pos)[::-1]
-    return float(np.sum(pos_sorted[:k]) / denom)
+def _ensure_indices(conn: sqlite3.Connection) -> None:
+    # stock_prices key
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stock_prices_symbol_date ON stock_prices(symbol, date);"
+    )
+    # kbar indices
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kbar_weekly_symbol_year_week ON kbar_weekly(symbol, year, week_id);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kbar_monthly_symbol_year_month ON kbar_monthly(symbol, year, month_id);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kbar_yearly_symbol_year ON kbar_yearly(symbol, year);"
+    )
+    conn.commit()
 
 
-def _topk_share_net(period_logrets: np.ndarray, denom: float, k: int) -> float:
-    if denom <= 0 or period_logrets.size == 0:
-        return 0.0
-    v = period_logrets[np.isfinite(period_logrets)]
-    if v.size == 0:
-        return 0.0
-    v_sorted = np.sort(v)[::-1]
-    return float(np.sum(v_sorted[:k]) / denom)
+def _drop_non_trading_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """移除顯著非交易列：volume==0 且 OHLC 全相等（常見於停牌/抓價缺失補值）。"""
+    if df.empty:
+        return df
+    cols = ["open", "high", "low", "close", "volume"]
+    for c in cols:
+        if c not in df.columns:
+            return df
+    mask_non_trade = (df["volume"].fillna(0) == 0) & (
+        (df["open"] == df["high"]) & (df["high"] == df["low"]) & (df["low"] == df["close"])
+    )
+    return df.loc[~mask_non_trade].copy()
 
 
-def _sum_pos_share(period_logrets: np.ndarray, denom: float) -> float:
-    if denom <= 0 or period_logrets.size == 0:
-        return 0.0
-    s = float(np.nansum(period_logrets[np.isfinite(period_logrets) & (period_logrets > 0)]))
-    return float(s / denom)
+def _safe_first(s: pd.Series):
+    s = s.dropna()
+    return s.iloc[0] if len(s) else np.nan
 
 
-def _sum_net_share(period_logrets: np.ndarray, denom: float) -> float:
-    if denom <= 0 or period_logrets.size == 0:
-        return 0.0
-    s = float(np.nansum(period_logrets[np.isfinite(period_logrets)]))
-    return float(s / denom)
-
-
-def _max_drawdown_log_from_close(close: pd.Series) -> float:
-    c = pd.to_numeric(close, errors="coerce")
-    c = c[(c > 0) & np.isfinite(c)]
-    if c.empty:
-        return 0.0
-    logc = np.log(c.values.astype(float))
-    run_max = np.maximum.accumulate(logc)
-    dd = logc - run_max
-    return float(np.min(dd))
+def _safe_last(s: pd.Series):
+    s = s.dropna()
+    return s.iloc[-1] if len(s) else np.nan
 
 
 # -----------------------------------------------------------------------------
-# period segmentation (精準切段)
+# Build weekly/monthly/yearly
 # -----------------------------------------------------------------------------
-def _sum_logret_by_period(
-    daily: pd.DataFrame,
-    periods: pd.DataFrame,
-    cutoff_date: Optional[pd.Timestamp] = None,
-) -> np.ndarray:
-    if daily.empty or periods.empty:
-        return np.array([], dtype=float)
+def build_weekly(df: pd.DataFrame, week_freq: str = "W-FRI") -> pd.DataFrame:
+    """df: columns = [symbol,date,open,high,low,close,volume]"""
+    if df.empty:
+        return pd.DataFrame()
 
-    d = daily[["date", "d_logret"]].copy()
-    d["date"] = pd.to_datetime(d["date"], errors="coerce")
-    d = d.dropna(subset=["date"]).sort_values("date")
-
-    if cutoff_date is not None and pd.notna(cutoff_date):
-        d = d[d["date"] <= cutoff_date]
-
+    df = df.sort_values(["symbol", "date"])
     out = []
-    for _, p in periods.iterrows():
-        ps = p["period_start"]
-        pe = p["period_end"]
-        if pd.isna(ps) or pd.isna(pe):
-            out.append(0.0)
+
+    for sym, g in df.groupby("symbol", sort=False):
+        g = g.sort_values("date").copy()
+        g = _drop_non_trading_rows(g)
+
+        # 可選：錯價清洗（不重算 prev_close；聚合只看 OHLCV）
+        if CLEANING_AVAILABLE and clean_pingpong_daily is not None:
+            try:
+                g = clean_pingpong_daily(
+                    g,
+                    threshold=0.40,
+                    abs_cap=0.80,
+                    recompute_prev_close=False,
+                    recompute_daily_change=False,
+                )
+            except Exception:
+                pass
+
+        if g.empty:
             continue
-        mask = (d["date"] >= ps) & (d["date"] <= pe)
-        out.append(float(d.loc[mask, "d_logret"].sum()))
-    return np.array(out, dtype=float)
 
+        g = g.set_index("date")
 
-def _align_peak_trade_date(daily_dates: pd.Series, peak_date: pd.Timestamp) -> Optional[pd.Timestamp]:
-    if peak_date is None or pd.isna(peak_date):
-        return None
-    dd = pd.to_datetime(daily_dates, errors="coerce").dropna().sort_values()
-    if dd.empty:
-        return None
-    dd2 = dd[dd <= peak_date]
-    if dd2.empty:
-        return None
-    return pd.Timestamp(dd2.iloc[-1])
-
-
-# -----------------------------------------------------------------------------
-# core
-# -----------------------------------------------------------------------------
-def build_contribution_tables(db_path: str, only_markets: Optional[set] = None) -> Dict[str, int]:
-    conn = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT)
-
-    try:
-        existing = set(pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)["name"].tolist())
-        required = ["kbar_yearly", "kbar_monthly", "kbar_weekly", "stock_analysis"]
-        missing = [t for t in required if t not in existing]
-        if missing:
-            raise RuntimeError(f"缺少必要表：{missing}\n請先跑 processor.py 與 kbar_aggregator.py")
-
-        # 年K
-        y = pd.read_sql(
-            """
-            SELECT symbol, year,
-                   period_start, period_end,
-                   open AS y_open, close AS y_close,
-                   year_peak_date, year_peak_high
-            FROM kbar_yearly
-            """,
-            conn,
+        agg = g.resample(week_freq).agg(
+            open=("open", _safe_first),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", _safe_last),
+            volume=("volume", "sum"),
+            period_start=("open", lambda x: x.index.min() if len(x) else pd.NaT),
+            period_end=("open", lambda x: x.index.max() if len(x) else pd.NaT),
         )
-        if y.empty:
-            print("❌ kbar_yearly 無資料")
-            return {"year_rows": 0, "bin_rows": 0}
 
-        # 市場過濾（可選）
-        if only_markets:
-            if "stock_info" not in existing:
-                raise RuntimeError("你傳了 only_markets 但 DB 沒有 stock_info 表，無法過濾市場")
-            info = pd.read_sql("SELECT symbol, market FROM stock_info", conn)
-            y = y.merge(info, on="symbol", how="left")
-            y = y[y["market"].str.lower().isin(set([m.lower() for m in only_markets]))].copy()
-            y = y.drop(columns=["market"], errors="ignore")
-            if y.empty:
-                print("❌ only_markets 過濾後 kbar_yearly 無資料")
-                return {"year_rows": 0, "bin_rows": 0}
+        agg = agg.dropna(subset=["open", "close"]).reset_index(drop=True)
+        if agg.empty:
+            continue
 
-        y["period_start"] = pd.to_datetime(y["period_start"], errors="coerce")
-        y["period_end"] = pd.to_datetime(y["period_end"], errors="coerce")
-        y["year_peak_date"] = pd.to_datetime(y["year_peak_date"], errors="coerce")
+        agg["symbol"] = sym
+        agg["year"] = pd.to_datetime(agg["period_end"]).dt.year.astype("Int64")
 
-        # 年報酬
-        y["year_ret_pct"] = (y["y_close"].astype(float) / y["y_open"].astype(float) - 1.0) * 100.0
-        y["year_logret"] = np.log(y["y_close"].astype(float) / y["y_open"].astype(float)).replace(
-            [np.inf, -np.inf], np.nan
-        ).fillna(0.0)
+        # week_id：同一年度內的週序（以 period_end 年為準），避免跨年週混淆
+        agg = agg.sort_values(["year", "period_end"])
+        agg["week_seq_in_year"] = agg.groupby("year").cumcount() + 1
+        agg["week_id"] = (agg["year"].astype(int) * 100 + agg["week_seq_in_year"]).astype("Int64")
+        agg = agg.drop(columns=["week_seq_in_year"])
 
-        # 年K分箱
-        y["year_ret_bin_100"] = y["year_ret_pct"].apply(_bin_year_ret_100)
-        y["year_ret_bin_10_under100"] = y["year_ret_pct"].apply(_bin_year_ret_10_under100)
-        y["year_ret_bin_50_under100"] = y["year_ret_pct"].apply(_bin_year_ret_50_under100)
+        # date strings
+        agg["period_start"] = pd.to_datetime(agg["period_start"]).dt.strftime("%Y-%m-%d")
+        agg["period_end"] = pd.to_datetime(agg["period_end"]).dt.strftime("%Y-%m-%d")
 
-        # 週/月 periods
-        wk = pd.read_sql(
-            """
-            SELECT symbol, year, week_id, period_start, period_end
-            FROM kbar_weekly
-            """,
-            conn,
+        out.append(agg)
+
+    if not out:
+        return pd.DataFrame()
+
+    wk = pd.concat(out, ignore_index=True)
+    return wk[
+        ["symbol", "year", "week_id", "period_start", "period_end", "open", "high", "low", "close", "volume"]
+    ]
+
+
+def build_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.sort_values(["symbol", "date"])
+    out = []
+
+    for sym, g in df.groupby("symbol", sort=False):
+        g = g.sort_values("date").copy()
+        g = _drop_non_trading_rows(g)
+
+        if CLEANING_AVAILABLE and clean_pingpong_daily is not None:
+            try:
+                g = clean_pingpong_daily(
+                    g,
+                    threshold=0.40,
+                    abs_cap=0.80,
+                    recompute_prev_close=False,
+                    recompute_daily_change=False,
+                )
+            except Exception:
+                pass
+
+        if g.empty:
+            continue
+
+        g = g.set_index("date")
+
+        agg = g.resample("M").agg(
+            open=("open", _safe_first),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", _safe_last),
+            volume=("volume", "sum"),
+            period_start=("open", lambda x: x.index.min() if len(x) else pd.NaT),
+            period_end=("open", lambda x: x.index.max() if len(x) else pd.NaT),
         )
-        mk = pd.read_sql(
-            """
-            SELECT symbol, year, month_id, period_start, period_end
-            FROM kbar_monthly
-            """,
-            conn,
-        )
-        wk["period_start"] = pd.to_datetime(wk["period_start"], errors="coerce")
-        wk["period_end"] = pd.to_datetime(wk["period_end"], errors="coerce")
-        mk["period_start"] = pd.to_datetime(mk["period_start"], errors="coerce")
-        mk["period_end"] = pd.to_datetime(mk["period_end"], errors="coerce")
+        agg = agg.dropna(subset=["open", "close"]).reset_index(drop=True)
+        if agg.empty:
+            continue
 
-        # 日K（stock_analysis）
-        sa = pd.read_sql(
-            """
-            SELECT symbol, date, open, close, prev_close, is_limit_up
-            FROM stock_analysis
-            """,
-            conn,
-        )
-        sa["date"] = pd.to_datetime(sa["date"], errors="coerce")
-        sa = sa.dropna(subset=["date"]).sort_values(["symbol", "date"])
-        sa["year"] = sa["date"].dt.year.astype(int)
-        sa["is_limit_up"] = pd.to_numeric(sa["is_limit_up"], errors="coerce").fillna(0).astype(int)
+        agg["symbol"] = sym
+        pe = pd.to_datetime(agg["period_end"])
+        agg["year"] = pe.dt.year.astype("Int64")
+        agg["month_id"] = (pe.dt.year * 100 + pe.dt.month).astype("Int64")
 
-        # 逐日 logret：
-        sa["d_logret"] = 0.0
-        mask_cp = (sa["close"].astype(float) > 0) & (sa["prev_close"].astype(float) > 0)
-        sa.loc[mask_cp, "d_logret"] = np.log(sa.loc[mask_cp, "close"].astype(float) / sa.loc[mask_cp, "prev_close"].astype(float))
+        agg["period_start"] = pd.to_datetime(agg["period_start"]).dt.strftime("%Y-%m-%d")
+        agg["period_end"] = pe.dt.strftime("%Y-%m-%d")
 
-        sa["rank_in_year"] = sa.groupby(["symbol", "year"]).cumcount()
-        mask_first = sa["rank_in_year"] == 0
-        mask_oc = mask_first & (sa["close"].astype(float) > 0) & (sa["open"].astype(float) > 0)
-        sa.loc[mask_oc, "d_logret"] = np.log(sa.loc[mask_oc, "close"].astype(float) / sa.loc[mask_oc, "open"].astype(float))
+        out.append(agg)
 
-        rows = []
-        for _, r in y.iterrows():
-            sym = r["symbol"]
-            yr = int(r["year"])
-            year_open = float(r["y_open"])
-            year_close = float(r["y_close"])
-            year_logret = float(r["year_logret"])
-            denom_year = year_logret if year_logret > 0 else 0.0
+    if not out:
+        return pd.DataFrame()
 
-            d = sa[(sa["symbol"] == sym) & (sa["year"] == yr)].copy()
-            if d.empty:
+    mk = pd.concat(out, ignore_index=True)
+    return mk[
+        ["symbol", "year", "month_id", "period_start", "period_end", "open", "high", "low", "close", "volume"]
+    ]
+
+
+def build_yearly(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.sort_values(["symbol", "date"])
+    out = []
+
+    for sym, g in df.groupby("symbol", sort=False):
+        g = g.sort_values("date").copy()
+        g = _drop_non_trading_rows(g)
+
+        if CLEANING_AVAILABLE and clean_pingpong_daily is not None:
+            try:
+                g = clean_pingpong_daily(
+                    g,
+                    threshold=0.40,
+                    abs_cap=0.80,
+                    recompute_prev_close=False,
+                    recompute_daily_change=False,
+                )
+            except Exception:
+                pass
+
+        if g.empty:
+            continue
+
+        g["year"] = g["date"].dt.year.astype("Int64")
+
+        for y, gy in g.groupby("year", sort=False):
+            if gy.empty:
                 continue
-            d = d.sort_values("date")
+            gy = gy.sort_values("date")
 
-            # 年內最大回撤
-            year_max_dd_log = _max_drawdown_log_from_close(d["close"])
+            period_start = gy["date"].iloc[0]
+            period_end = gy["date"].iloc[-1]
 
-            # peak date 對齊
-            peak_date_raw = r["year_peak_date"]
-            peak_trade_date = _align_peak_trade_date(d["date"], peak_date_raw) if pd.notna(peak_date_raw) else None
+            y_open = _safe_first(gy["open"])
+            y_close = _safe_last(gy["close"])
+            y_high = gy["high"].max()
+            y_low = gy["low"].min()
+            y_vol = gy["volume"].sum()
 
-            peak_close = np.nan
-            if peak_trade_date is not None:
-                d_peak = d[d["date"] == peak_trade_date]
-                if not d_peak.empty:
-                    peak_close = float(d_peak.iloc[-1]["close"])
+            # 年內 peak：以 daily high 的最大值為準
+            idx_peak = gy["high"].idxmax()
+            peak_date = gy.loc[idx_peak, "date"] if pd.notna(idx_peak) else period_end
+            peak_high = float(gy.loc[idx_peak, "high"]) if pd.notna(idx_peak) else float(y_high)
 
-            peak_logret = _safe_log_ratio(peak_close, year_open) if np.isfinite(peak_close) else 0.0
-            denom_peak = peak_logret if peak_logret > 0 else 0.0
-
-            # 從 peak 到年末回撤
-            peak_to_year_end_dd_log = 0.0
-            if peak_trade_date is not None and np.isfinite(peak_close) and peak_close > 0:
-                year_end_close = float(d.iloc[-1]["close"]) if np.isfinite(d.iloc[-1]["close"]) else np.nan
-                peak_to_year_end_dd_log = _safe_log_ratio(year_end_close, peak_close) if np.isfinite(year_end_close) else 0.0
-
-            # 週/月 periods
-            wps = wk[(wk["symbol"] == sym) & (wk["year"] == yr)].sort_values("period_end")
-            mps = mk[(mk["symbol"] == sym) & (mk["year"] == yr)].sort_values("period_end")
-
-            # 精準切段：日K切週/月
-            w_logrets = _sum_logret_by_period(daily=d, periods=wps, cutoff_date=None)
-            m_logrets = _sum_logret_by_period(daily=d, periods=mps, cutoff_date=None)
-
-            worst_week_logret = float(np.nanmin(w_logrets)) if w_logrets.size > 0 else 0.0
-            worst_month_logret = float(np.nanmin(m_logrets)) if m_logrets.size > 0 else 0.0
-
-            # 集中度（POS/NET）
-            top1_week_share_pos = _topk_share_pos(w_logrets, denom_year, 1)
-            top4_weeks_share_pos = _topk_share_pos(w_logrets, denom_year, 4)
-            top1_week_share_net = _topk_share_net(w_logrets, denom_year, 1)
-            top4_weeks_share_net = _topk_share_net(w_logrets, denom_year, 4)
-
-            top1_month_share_pos = _topk_share_pos(m_logrets, denom_year, 1)
-            top3_months_share_pos = _topk_share_pos(m_logrets, denom_year, 3)
-            top1_month_share_net = _topk_share_net(m_logrets, denom_year, 1)
-            top3_months_share_net = _topk_share_net(m_logrets, denom_year, 3)
-
-            sum_pos_week_share = _sum_pos_share(w_logrets, denom_year)
-            sum_net_week_share = _sum_net_share(w_logrets, denom_year)
-            sum_pos_month_share = _sum_pos_share(m_logrets, denom_year)
-            sum_net_month_share = _sum_net_share(m_logrets, denom_year)
-
-            # ✅ burst label（你說都來）
-            burst_style_week = "ONE_WEEK_BURST" if top1_week_share_net >= 0.5 else "NON_CONCENTRATED"
-            burst_style_month = "ONE_MONTH_BURST" if top1_month_share_net >= 0.5 else "NON_CONCENTRATED"
-
-            # peak 前：日K到 peak
-            logret_to_peak = 0.0
-            if peak_trade_date is not None:
-                logret_to_peak = float(d.loc[d["date"] <= peak_trade_date, "d_logret"].sum())
-
-            share_year_to_peak = float(logret_to_peak / denom_year) if denom_year > 0 else 0.0
-            share_peak_to_peak = float(logret_to_peak / denom_peak) if denom_peak > 0 else 0.0
-
-            # peak 前：週/月切段到 peak
-            w_logrets_to_peak = _sum_logret_by_period(daily=d, periods=wps, cutoff_date=peak_trade_date)
-            m_logrets_to_peak = _sum_logret_by_period(daily=d, periods=mps, cutoff_date=peak_trade_date)
-
-            week_pos_log_share_to_peak_vs_year = float(np.nansum(w_logrets_to_peak[w_logrets_to_peak > 0]) / denom_year) if denom_year > 0 else 0.0
-            week_net_log_share_to_peak_vs_year = float(np.nansum(w_logrets_to_peak[np.isfinite(w_logrets_to_peak)]) / denom_year) if denom_year > 0 else 0.0
-            month_pos_log_share_to_peak_vs_year = float(np.nansum(m_logrets_to_peak[m_logrets_to_peak > 0]) / denom_year) if denom_year > 0 else 0.0
-            month_net_log_share_to_peak_vs_year = float(np.nansum(m_logrets_to_peak[np.isfinite(m_logrets_to_peak)]) / denom_year) if denom_year > 0 else 0.0
-
-            week_pos_log_share_to_peak_vs_peak = float(np.nansum(w_logrets_to_peak[w_logrets_to_peak > 0]) / denom_peak) if denom_peak > 0 else 0.0
-            week_net_log_share_to_peak_vs_peak = float(np.nansum(w_logrets_to_peak[np.isfinite(w_logrets_to_peak)]) / denom_peak) if denom_peak > 0 else 0.0
-            month_pos_log_share_to_peak_vs_peak = float(np.nansum(m_logrets_to_peak[m_logrets_to_peak > 0]) / denom_peak) if denom_peak > 0 else 0.0
-            month_net_log_share_to_peak_vs_peak = float(np.nansum(m_logrets_to_peak[np.isfinite(m_logrets_to_peak)]) / denom_peak) if denom_peak > 0 else 0.0
-
-            # peak 前漲停貢獻（日K logret）
-            if peak_trade_date is not None:
-                d_to_peak = d[d["date"] <= peak_trade_date]
-            else:
-                d_to_peak = d
-
-            limitup_count_to_peak = int((d_to_peak["is_limit_up"] == 1).sum())
-            limitup_log_sum_to_peak = float(d_to_peak.loc[d_to_peak["is_limit_up"] == 1, "d_logret"].sum())
-            limitup_log_share_to_peak_vs_year = float(limitup_log_sum_to_peak / denom_year) if denom_year > 0 else 0.0
-            limitup_log_share_to_peak_vs_peak = float(limitup_log_sum_to_peak / denom_peak) if denom_peak > 0 else 0.0
-
-            rows.append(
+            out.append(
                 {
                     "symbol": sym,
-                    "year": yr,
-
-                    # 年K
-                    "y_open": year_open,
-                    "y_close": year_close,
-                    "year_ret_pct": float(r["year_ret_pct"]),
-                    "year_logret": year_logret,
-
-                    # bins
-                    "year_ret_bin_100": r["year_ret_bin_100"],
-                    "year_ret_bin_10_under100": r["year_ret_bin_10_under100"],
-                    "year_ret_bin_50_under100": r["year_ret_bin_50_under100"],
-
-                    # ✅ burst style
-                    "burst_style_week": burst_style_week,
-                    "burst_style_month": burst_style_month,
-
-                    # peak
-                    "year_peak_date_raw": peak_date_raw.strftime("%Y-%m-%d") if pd.notna(peak_date_raw) else None,
-                    "year_peak_trade_date": peak_trade_date.strftime("%Y-%m-%d") if peak_trade_date is not None else None,
-                    "year_peak_high": float(r["year_peak_high"]) if np.isfinite(r["year_peak_high"]) else np.nan,
-                    "peak_close_aligned": peak_close if np.isfinite(peak_close) else np.nan,
-                    "peak_logret_from_open": peak_logret,
-
-                    # 回撤
-                    "year_max_drawdown_log": year_max_dd_log,
-                    "peak_to_year_end_drawdown_log": peak_to_year_end_dd_log,
-                    "worst_week_logret": worst_week_logret,
-                    "worst_month_logret": worst_month_logret,
-
-                    # 週/月集中度（全年）
-                    "top1_week_share_pos": top1_week_share_pos,
-                    "top4_weeks_share_pos": top4_weeks_share_pos,
-                    "top1_week_share_net": top1_week_share_net,
-                    "top4_weeks_share_net": top4_weeks_share_net,
-
-                    "top1_month_share_pos": top1_month_share_pos,
-                    "top3_months_share_pos": top3_months_share_pos,
-                    "top1_month_share_net": top1_month_share_net,
-                    "top3_months_share_net": top3_months_share_net,
-
-                    "sum_pos_week_share": sum_pos_week_share,
-                    "sum_net_week_share": sum_net_week_share,
-                    "sum_pos_month_share": sum_pos_month_share,
-                    "sum_net_month_share": sum_net_month_share,
-
-                    # peak 前完成度
-                    "logret_to_peak": logret_to_peak,
-                    "share_year_to_peak": share_year_to_peak,
-                    "share_peak_to_peak": share_peak_to_peak,
-
-                    # peak 前週/月貢獻（POS/NET）
-                    "week_pos_log_share_to_peak_vs_year": week_pos_log_share_to_peak_vs_year,
-                    "week_net_log_share_to_peak_vs_year": week_net_log_share_to_peak_vs_year,
-                    "month_pos_log_share_to_peak_vs_year": month_pos_log_share_to_peak_vs_year,
-                    "month_net_log_share_to_peak_vs_year": month_net_log_share_to_peak_vs_year,
-
-                    "week_pos_log_share_to_peak_vs_peak": week_pos_log_share_to_peak_vs_peak,
-                    "week_net_log_share_to_peak_vs_peak": week_net_log_share_to_peak_vs_peak,
-                    "month_pos_log_share_to_peak_vs_peak": month_pos_log_share_to_peak_vs_peak,
-                    "month_net_log_share_to_peak_vs_peak": month_net_log_share_to_peak_vs_peak,
-
-                    # 漲停貢獻（peak 前）
-                    "limitup_count_to_peak": limitup_count_to_peak,
-                    "limitup_log_sum_to_peak": limitup_log_sum_to_peak,
-                    "limitup_log_share_to_peak_vs_year": limitup_log_share_to_peak_vs_year,
-                    "limitup_log_share_to_peak_vs_peak": limitup_log_share_to_peak_vs_peak,
+                    "year": int(y),
+                    "period_start": pd.to_datetime(period_start).strftime("%Y-%m-%d"),
+                    "period_end": pd.to_datetime(period_end).strftime("%Y-%m-%d"),
+                    "open": float(y_open) if pd.notna(y_open) else np.nan,
+                    "high": float(y_high) if pd.notna(y_high) else np.nan,
+                    "low": float(y_low) if pd.notna(y_low) else np.nan,
+                    "close": float(y_close) if pd.notna(y_close) else np.nan,
+                    "volume": float(y_vol) if pd.notna(y_vol) else np.nan,
+                    "year_peak_date": pd.to_datetime(peak_date).strftime("%Y-%m-%d"),
+                    "year_peak_high": peak_high,
                 }
             )
 
-        out = pd.DataFrame(rows)
-        if out.empty:
-            print("❌ year_contribution 無資料（可能 year/kbar 對不起來或 stock_analysis 缺日K）")
-            return {"year_rows": 0, "bin_rows": 0}
+    if not out:
+        return pd.DataFrame()
 
-        # 寫回 year_contribution
-        conn.execute("DROP TABLE IF EXISTS year_contribution")
-        out.to_sql("year_contribution", conn, if_exists="replace", index=False)
+    yk = pd.DataFrame(out)
+    return yk[
+        ["symbol", "year", "period_start", "period_end", "open", "high", "low", "close", "volume", "year_peak_date", "year_peak_high"]
+    ]
 
-        try:
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_symbol_year ON year_contribution(symbol, year)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_bin100 ON year_contribution(year_ret_bin_100)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_burst_week ON year_contribution(burst_style_week)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_burst_month ON year_contribution(burst_style_month)")
-        except Exception:
-            pass
 
-        # bins summary（以 100% 分箱為主）
-        def _agg(df: pd.DataFrame) -> pd.Series:
-            return pd.Series(
-                {
-                    "n": int(len(df)),
-                    "avg_year_ret_pct": float(df["year_ret_pct"].mean()),
-                    "median_year_ret_pct": float(df["year_ret_pct"].median()),
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
+def build_kbar_tables(
+    db_path: str,
+    date_min: Optional[str] = None,
+    date_max: Optional[str] = None,
+    week_freq: str = "W-FRI",
+    verbose: bool = True,
+) -> Tuple[int, int, int]:
+    """Build and write kbar_weekly / kbar_monthly / kbar_yearly.
 
-                    # 集中度（pos/net）
-                    "avg_top1_week_share_pos": float(df["top1_week_share_pos"].mean()),
-                    "avg_top1_week_share_net": float(df["top1_week_share_net"].mean()),
-                    "avg_top1_month_share_pos": float(df["top1_month_share_pos"].mean()),
-                    "avg_top1_month_share_net": float(df["top1_month_share_net"].mean()),
+    Returns:
+        (n_weekly_rows, n_monthly_rows, n_yearly_rows)
+    """
+    conn = _connect(db_path)
 
-                    # burst 比例
-                    "pct_one_week_burst": float((df["burst_style_week"] == "ONE_WEEK_BURST").mean() * 100),
-                    "pct_one_month_burst": float((df["burst_style_month"] == "ONE_MONTH_BURST").mean() * 100),
+    where = []
+    params = []
+    if date_min:
+        where.append("date >= ?")
+        params.append(date_min)
+    if date_max:
+        where.append("date <= ?")
+        params.append(date_max)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
-                    # peak 完成度
-                    "avg_share_year_to_peak": float(df["share_year_to_peak"].mean()),
+    df = pd.read_sql(
+        f"""
+        SELECT symbol, date, open, high, low, close, volume
+        FROM stock_prices
+        {where_sql}
+        """,
+        conn,
+        params=params,
+        parse_dates=["date"],
+    )
 
-                    # 漲停貢獻
-                    "avg_limitup_count_to_peak": float(df["limitup_count_to_peak"].mean()),
-                    "avg_limitup_log_share_to_peak_vs_year": float(df["limitup_log_share_to_peak_vs_year"].mean()),
-                    "avg_limitup_log_share_to_peak_vs_peak": float(df["limitup_log_share_to_peak_vs_peak"].mean()),
-
-                    # 回撤
-                    "avg_year_max_drawdown_log": float(df["year_max_drawdown_log"].mean()),
-                    "avg_peak_to_year_end_drawdown_log": float(df["peak_to_year_end_drawdown_log"].mean()),
-
-                    # 直覺門檻
-                    "pct_top1_week_net_ge_0_4": float((df["top1_week_share_net"] >= 0.4).mean() * 100),
-                    "pct_top1_month_net_ge_0_4": float((df["top1_month_share_net"] >= 0.4).mean() * 100),
-                    "pct_limitup_share_year_ge_0_4": float((df["limitup_log_share_to_peak_vs_year"] >= 0.4).mean() * 100),
-                    "pct_peak_to_year_end_dd_le_m0_2": float((df["peak_to_year_end_drawdown_log"] <= -0.2).mean() * 100),
-                }
-            )
-
-        bins = out.groupby("year_ret_bin_100", sort=False).apply(_agg).reset_index()
-        conn.execute("DROP TABLE IF EXISTS year_contribution_bins")
-        bins.to_sql("year_contribution_bins", conn, if_exists="replace", index=False)
-
-        try:
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_year_contrib_bins_bin ON year_contribution_bins(year_ret_bin_100)")
-        except Exception:
-            pass
-
-        conn.commit()
-
-        print("\n✅ kbar_contribution（精準切段｜都來）完成：")
-        print(f"📌 year_contribution rows: {len(out):,}")
-        print(f"📌 year_contribution_bins rows: {len(bins):,}")
-        print("📌 burst labels：burst_style_week / burst_style_month 已加入")
-
-        return {"year_rows": int(len(out)), "bin_rows": int(len(bins))}
-
-    finally:
+    if df.empty:
+        if verbose:
+            print("❌ stock_prices 無資料，無法聚合 K 線")
         conn.close()
+        return (0, 0, 0)
 
+    # 基本清理：確保數值型
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python kbar_contribution.py <db_path>")
-        sys.exit(1)
+    wk = build_weekly(df, week_freq=week_freq)
+    mk = build_monthly(df)
+    yk = build_yearly(df)
 
-    build_contribution_tables(sys.argv[1])
+    # write back
+    wk.to_sql("kbar_weekly", conn, if_exists="replace", index=False)
+    mk.to_sql("kbar_monthly", conn, if_exists="replace", index=False)
+    yk.to_sql("kbar_yearly", conn, if_exists="replace", index=False)
+
+    _ensure_indices(conn)
+
+    if verbose:
+        print(f"✅ kbar_weekly rows: {len(wk):,}")
+        print(f"✅ kbar_monthly rows: {len(mk):,}")
+        print(f"✅ kbar_yearly rows: {len(yk):,}")
+        print(f"🧼 data_cleaning available: {CLEANING_AVAILABLE}")
+
+    conn.close()
+    return (len(wk), len(mk), len(yk))
