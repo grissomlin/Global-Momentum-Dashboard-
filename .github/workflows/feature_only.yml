@@ -1,16 +1,83 @@
-name: Only Feature Engineering
+name: Only Feature Engineering (Parallel)
 
 on:
   workflow_dispatch:
     inputs:
+      market_mode:
+        description: "模式：單一 / 全部 / 自訂多國"
+        required: true
+        default: "single"
+        type: choice
+        options:
+          - single
+          - all
+          - custom
       market:
-        description: "market: tw/us/cn/hk/jp/kr/all"
+        description: "單一市場（market_mode=single 才用）"
         required: true
         default: "tw"
+        type: choice
+        options:
+          - tw
+          - us
+          - cn
+          - hk
+          - jp
+          - kr
+      markets_csv:
+        description: "自訂多國（market_mode=custom）：tw,us,jp（逗號分隔）"
+        required: false
+        default: ""
 
 jobs:
-  process:
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Build matrix JSON
+        id: set-matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODE="${{ github.event.inputs.market_mode }}"
+          SINGLE="${{ github.event.inputs.market }}"
+          CSV_RAW="${{ github.event.inputs.markets_csv }}"
+
+          # normalize
+          CSV="$(echo "$CSV_RAW" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+
+          ALL='["tw","us","cn","hk","jp","kr"]'
+
+          if [ "$MODE" = "all" ]; then
+            MATRIX="$ALL"
+          elif [ "$MODE" = "single" ]; then
+            MATRIX="[\"$SINGLE\"]"
+          elif [ "$MODE" = "custom" ]; then
+            if [ -z "$CSV" ]; then
+              echo "Custom mode requires markets_csv, e.g. tw,us,jp" >&2
+              exit 2
+            fi
+            # convert "tw,us,jp" -> ["tw","us","jp"]
+            MATRIX="[\"${CSV//,/\",\"}\"]"
+          else
+            echo "Unknown market_mode: $MODE" >&2
+            exit 2
+          fi
+
+          echo "matrix=$MATRIX"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  process:
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        market: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
     env:
       GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
@@ -31,41 +98,32 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pandas numpy google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dotenv
 
-      # 可選：DB cache（用 market 當 key）
+      # 這個 cache 是「每個 market 各自一份」，並行時不互搶
       - name: 💾 Restore DB Cache (optional)
         uses: actions/cache@v4
         with:
           path: "*.db"
-          key: db-cache-v1-${{ github.event.inputs.market }}
+          key: db-cache-v3-${{ matrix.market }}
           restore-keys: |
-            db-cache-v1-
+            db-cache-v3-${{ matrix.market }}
 
       - name: 🧪 Run Feature Engineering
         shell: bash
         run: |
           set -euo pipefail
-          MARKET="${{ github.event.inputs.market }}"
-          echo "🧪 Input market = $MARKET"
+          echo "🧪 Running market: ${{ matrix.market }}"
+          python -u only_feature.py ${{ matrix.market }}
 
-          if [ "$MARKET" = "all" ]; then
-            for m in tw us cn hk jp kr; do
-              echo "▶️ Running only_feature for $m"
-              python -u only_feature.py "$m"
-            done
-          else
-            echo "▶️ Running only_feature for $MARKET"
-            python -u only_feature.py "$MARKET"
-          fi
-
+      # ✅ 每個市場各觸發一次（並行 job 各自執行）
       - name: 📢 Trigger Alpha Data Lab Sync (optional)
-        if: success() && github.event.inputs.market != 'all'
+        if: success()
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         shell: bash
         run: |
           set -euo pipefail
-          DB_NAME="${{ github.event.inputs.market }}_stock_warehouse"
-          echo "🚀 市場 ${{ github.event.inputs.market }} 加工完成，通知 Alpha Data Lab..."
+          DB_NAME="${{ matrix.market }}_stock_warehouse"
+          echo "🚀 市場 ${{ matrix.market }} 加工完成，通知 Alpha Data Lab..."
           curl -sS -X POST https://api.github.com/repos/grissomlin/Alpha-Data-Cleaning-Lab/dispatches \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Authorization: bearer $GH_PAT" \
