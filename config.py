@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 
 # ====== 強制日期限制（鎖死 2024-2025）======
-FORCE_START_DATE = "2024-01-01"
-FORCE_END_DATE = "2025-12-31"
-
+FORCE_START_DATE = "2020-01-01"
+FORCE_END_DATE   = "2026-12-31"
 # ====== 系統設定 ======
 SOCKET_TIMEOUT = 600
 
