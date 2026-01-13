@@ -13,19 +13,28 @@ jobs:
 
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 2
       matrix:
         market: [tw, us, cn, hk, jp, kr]
 
     env:
       MAX_WORKERS: "3"
       BATCH_SIZE: "200"
+
+      # Google Drive secrets
       GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID_EMPTY }}
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Check Drive env (safe)
+        run: |
+          echo "GDRIVE_FOLDER_ID is set? -> $([ -n "$GDRIVE_FOLDER_ID" ] && echo YES || echo NO)"
+          echo "GDRIVE_SERVICE_ACCOUNT is set? -> $([ -n "$GDRIVE_SERVICE_ACCOUNT" ] && echo YES || echo NO)"
+          echo "GDRIVE_FOLDER_ID length: ${#GDRIVE_FOLDER_ID}"
+          echo "GDRIVE_SERVICE_ACCOUNT length: ${#GDRIVE_SERVICE_ACCOUNT}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -48,13 +57,6 @@ jobs:
         run: |
           rm -f ${{ matrix.market }}_stock_warehouse.db
           echo "✅ removed old local db: ${{ matrix.market }}_stock_warehouse.db"
-
-      - name: Check Drive env (safe)
-        run: |
-          echo "GDRIVE_FOLDER_ID is set? -> $([ -n "$GDRIVE_FOLDER_ID" ] && echo YES || echo NO)"
-          echo "GDRIVE_SERVICE_ACCOUNT is set? -> $([ -n "$GDRIVE_SERVICE_ACCOUNT" ] && echo YES || echo NO)"
-          echo "GDRIVE_FOLDER_ID length: ${#GDRIVE_FOLDER_ID}"
-          echo "GDRIVE_SERVICE_ACCOUNT length: ${#GDRIVE_SERVICE_ACCOUNT}"
 
       - name: Build DB (one market)
         run: |
