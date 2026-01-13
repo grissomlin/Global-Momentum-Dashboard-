@@ -1,4 +1,4 @@
-name: Build 6 Markets DB (One-shot, Parallel)
+name: Build 6 Markets DB (One-shot, Parallel + Upload to Google Drive)
 
 on:
   workflow_dispatch:
@@ -7,6 +7,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
     strategy:
       fail-fast: false
       max-parallel: 6
@@ -14,13 +15,14 @@ jobs:
         market: [tw, us, cn, hk, jp, kr]
 
     env:
-      # ✅ 一次性建庫，避免風控：先保守一點
+      # ✅ 一次性建庫：先保守一點避免風控/封鎖
       MAX_WORKERS: "3"
       BATCH_SIZE: "200"
 
-      # ✅ 這次不要放 GDRIVE_*，避免下載舊 DB 覆蓋
-      # GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
-      # GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+      # ✅ 啟用 Google Drive（重點）
+      # 用「全新空資料夾」避免下載舊 DB 覆蓋本地 one-shot DB
+      GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID_EMPTY }}
 
     steps:
       - name: Checkout Code
@@ -43,14 +45,56 @@ jobs:
             pip install pykrx finance-datareader akshare
           fi
 
+      # ✅ one-shot：每次 job 都從空 DB 開始
       - name: Ensure empty db
         run: |
           rm -f ${{ matrix.market }}_stock_warehouse.db
+          echo "✅ removed old local db (if any): ${{ matrix.market }}_stock_warehouse.db"
+
+      # （可選）顯示環境變數是否有注入（不要印 secrets 內容）
+      - name: Check Drive env (safe)
+        run: |
+          echo "GDRIVE_FOLDER_ID is set? -> $([ -n "$GDRIVE_FOLDER_ID" ] && echo YES || echo NO)"
+          echo "GDRIVE_SERVICE_ACCOUNT is set? -> $([ -n "$GDRIVE_SERVICE_ACCOUNT" ] && echo YES || echo NO)"
 
       - name: Build DB (one market)
         run: |
           echo "🌍 Build market: ${{ matrix.market }}"
           python -u main.py ${{ matrix.market }}
+
+      # （可選）檢查 DB 是否真的長大 + 表數量
+      - name: Inspect DB size and tables
+        if: always()
+        run: |
+          DB="${{ matrix.market }}_stock_warehouse.db"
+          if [ -f "$DB" ]; then
+            echo "✅ DB exists: $DB"
+            ls -lh "$DB"
+            python - << 'PY'
+import os, sqlite3, sys
+db = os.environ.get("DB_PATH")
+if not db:
+    db = sys.argv[1] if len(sys.argv)>1 else None
+if not db or not os.path.exists(db):
+    print("DB not found")
+    raise SystemExit(0)
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+tables = cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+print("Tables:", [t[0] for t in tables])
+for t in ["stock_prices","stock_info","stock_analysis","kbar_weekly","kbar_monthly","kbar_yearly","download_errors"]:
+    try:
+        n = cur.execute(f"SELECT COUNT(1) FROM {t}").fetchone()[0]
+        print(f"{t}: {n:,}")
+    except Exception as e:
+        print(f"{t}: (missing) {e}")
+conn.close()
+PY
+          else
+            echo "❌ DB not found: $DB"
+          fi
+        env:
+          DB_PATH: ${{ matrix.market }}_stock_warehouse.db
 
       - name: Upload DB artifact
         if: always()
