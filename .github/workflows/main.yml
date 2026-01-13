@@ -6,6 +6,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: build-6-markets
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,11 +22,11 @@ jobs:
         market: [tw, us, cn, hk, jp, kr]
 
     env:
+      # 保守避免風控
       MAX_WORKERS: "3"
       BATCH_SIZE: "200"
 
-      # Google Drive secrets（你要在 Repo Settings > Secrets and variables > Actions 設好）
-      # 注意：service account 需要對該 folder 有權限（folder 要 share 給 service account email）
+      # Google Drive（你要在 Repo Secrets 設好）
       GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID_EMPTY }}
 
@@ -30,12 +34,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Sanity check workflow files
+      - name: Sanity check workflow placement
         run: |
           echo "PWD=$(pwd)"
           ls -la .github || true
           ls -la .github/workflows || true
-          echo "✅ workflow file should be at .github/workflows/main.yml"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -54,15 +57,17 @@ jobs:
             pip install pykrx finance-datareader akshare
           fi
 
+      # one-shot：每個 job 都從空 DB 開始
       - name: Ensure empty db
         run: |
           rm -f ${{ matrix.market }}_stock_warehouse.db
           echo "✅ removed old local db (if any): ${{ matrix.market }}_stock_warehouse.db"
 
+      # 不印 secrets，只檢查是否有注入
       - name: Check Drive env (safe)
         run: |
-          echo "GDRIVE_FOLDER_ID is set? -> $([ -n "$GDRIVE_FOLDER_ID" ] && echo YES || echo NO)"
-          echo "GDRIVE_SERVICE_ACCOUNT is set? -> $([ -n "$GDRIVE_SERVICE_ACCOUNT" ] && echo YES || echo NO)"
+          echo "GDRIVE_FOLDER_ID set? -> $([ -n "$GDRIVE_FOLDER_ID" ] && echo YES || echo NO)"
+          echo "GDRIVE_SERVICE_ACCOUNT set? -> $([ -n "$GDRIVE_SERVICE_ACCOUNT" ] && echo YES || echo NO)"
           echo "GDRIVE_FOLDER_ID length: ${#GDRIVE_FOLDER_ID}"
           echo "GDRIVE_SERVICE_ACCOUNT length: ${#GDRIVE_SERVICE_ACCOUNT}"
 
