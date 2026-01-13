@@ -1,6 +1,6 @@
-name: Build 6 Markets DB (One-shot, Parallel + Upload to Google Drive)
+name: Build 6 Markets DB (Manual Dispatch + Upload to Google Drive)
 
-on:
+"on":
   workflow_dispatch:
 
 permissions:
@@ -21,14 +21,20 @@ jobs:
       MAX_WORKERS: "3"
       BATCH_SIZE: "200"
 
-      # Google Drive secrets (Settings > Secrets and variables > Actions)
-      # service account 必須被 share 到該資料夾（用 service account email 分享）
+      # Google Drive（你要在 Repo Settings > Secrets and variables > Actions 設好）
       GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID_EMPTY }}
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Sanity check workflow path
+        run: |
+          echo "PWD=$(pwd)"
+          ls -la .github || true
+          ls -la .github/workflows || true
+          echo "✅ current workflow file: .github/workflows/build_6_markets.yml"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -47,15 +53,17 @@ jobs:
             pip install pykrx finance-datareader akshare
           fi
 
-      - name: Ensure empty db
+      - name: Ensure empty db (one-shot)
         run: |
           rm -f ${{ matrix.market }}_stock_warehouse.db
-          echo "✅ removed old local db (if any): ${{ matrix.market }}_stock_warehouse.db"
+          echo "✅ removed old local db: ${{ matrix.market }}_stock_warehouse.db"
 
       - name: Check Drive env (safe)
         run: |
-          echo "GDRIVE_FOLDER_ID set? -> $([ -n "$GDRIVE_FOLDER_ID" ] && echo YES || echo NO)"
-          echo "GDRIVE_SERVICE_ACCOUNT set? -> $([ -n "$GDRIVE_SERVICE_ACCOUNT" ] && echo YES || echo NO)"
+          echo "GDRIVE_FOLDER_ID is set? -> $([ -n "$GDRIVE_FOLDER_ID" ] && echo YES || echo NO)"
+          echo "GDRIVE_SERVICE_ACCOUNT is set? -> $([ -n "$GDRIVE_SERVICE_ACCOUNT" ] && echo YES || echo NO)"
+          echo "GDRIVE_FOLDER_ID length: ${#GDRIVE_FOLDER_ID}"
+          echo "GDRIVE_SERVICE_ACCOUNT length: ${#GDRIVE_SERVICE_ACCOUNT}"
 
       - name: Build DB (one market)
         run: |
